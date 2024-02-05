@@ -1,0 +1,78 @@
+{
+  "output_dir": "ckpt/coscos",
+  "max_steps": 200000,
+  "logging_steps": 50,
+  "eval_steps": 1000,
+  "save_limit": 2,
+  "ema_beta": 0.9995,
+  "eval_n_samples": 50,
+  "eval_sample_steps": 20,
+  "eval_ema_only": false,
+  "batch_size": 128,
+  "lr": 0.0002,
+  "optim": "adamw",
+  "adam_betas": [
+    0.9,
+    0.99
+  ],
+  "clip_grad_norm": 1.0,
+  "augmentations": [
+    "RandomHorizontalFlip"
+  ],
+  "dataloader_drop_last": true,
+  "dataloader_pin_memory": true,
+  "dataloader_num_workers": 2,
+  "dataset_dir": "datasets",
+  "device": "cuda",
+  "seed": 1234,
+  "worker_seed": 1234,
+  "dpm_cfg": {
+    "model": {
+      "type": "ClsCondUNetPredictor",
+      "args": {
+        "block_out_channels": [
+          128,
+          256,
+          384,
+          384
+        ],
+        "down_block_types": [
+          "DownBlock2D",
+          "AttnDownBlock2D",
+          "AttnDownBlock2D",
+          "AttnDownBlock2D"
+        ],
+        "up_block_types": [
+          "AttnUpBlock2D",
+          "AttnUpBlock2D",
+          "AttnUpBlock2D",
+          "UpBlock2D"
+        ],
+        "norm_num_groups": 16,
+        "num_class_embeds": 10,
+        "resnet_time_scale_shift": "scale_shift",
+        "dropout": 0.1
+      }
+    },
+    "scheduler": {
+      "type": "CosCosAlphaScheduler",
+      "args": {
+        "clip_st": 0.03,
+        "clip_ed": 0.95
+      }
+    },
+    "pipeline": {
+      "type": "ContinuousDiffusion",
+      "args": {
+        "p_uncond": 0.2
+      }
+    }
+  },
+  "dpm_discrete": false,
+  "fid_eval": true,
+  "fid_ema": true,
+  "fid_eval_steps": 10000,
+  "fid_n_samples": 5000,
+  "fid_sample_steps": 10,
+  "fid_seed": 1234
+}
