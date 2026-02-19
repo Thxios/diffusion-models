@@ -6,10 +6,11 @@ from typing import Optional, Tuple
 from modeling.blocks import get_down_block, get_up_block, MidBlock
 from modeling.activation import get_activation
 from modeling.embeddings import PeriodicEncoding, MLPEmbedding
+from modeling.predictor import GuidedPredictor
 
 
 
-class UNet(nn.Module):
+class UNet(nn.Module, GuidedPredictor):
     """
     UNet
     same architecture with `diffusers.UNet2DModel`
@@ -160,3 +161,7 @@ class UNet(nn.Module):
         x = self.out_act(x)
         x = self.out_conv(x)
         return x
+    
+    def pred_conditional(self, z, t, cond=None, uncond_mask=None):
+        return self.forward(z, t, cls=cond, uncond_mask=uncond_mask)
+
