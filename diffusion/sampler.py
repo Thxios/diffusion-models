@@ -11,7 +11,7 @@ def get_sampler(name, **kwargs):
     if name == 'ddim':
         return DDIMSampler(**kwargs)
     elif name == 'euler':
-        return EulerSampler(**kwargs)
+        return RectifiedFlowEulerSampler(**kwargs)
     else:
         raise ValueError(f'unknown sampler {name}')
     
@@ -35,7 +35,7 @@ class BaseSampler:
             self,
             z: torch.Tensor,
             scheduler,
-            pred_fn: Callable[..., torch.Tensor],
+            pred_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
             **kwargs
     ):
         raise NotImplementedError()
@@ -43,23 +43,25 @@ class BaseSampler:
 
 
 class DDIMSampler(BaseSampler):
-    def __init__(self, n_steps, eta=0.0, pbar=False, pbar_kwargs=None):
+    def __init__(self, n_steps, eta=0.0, clip_latent=True, pbar=False, pbar_kwargs=None):
         super().__init__(n_steps, pbar, pbar_kwargs)
         self.eta = eta
+        self.clip_latent = clip_latent
     
     @torch.no_grad()
     def sample(
             self,
             z: torch.Tensor,
             scheduler: VariancePreservingScheduler,
-            pred_fn: Callable[..., torch.Tensor],
-            clip_latent=True,
+            pred_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     ):
 
-        t_steps = torch.linspace(scheduler.n_steps - 1, 0,
-                                 steps=self.n_steps + 1,
-                                 dtype=torch.int64,
-                                 device=z.device)[:-1]
+        t_steps = torch.linspace(
+            scheduler.n_steps - 1, 0,
+            steps=self.n_steps + 1,
+            dtype=torch.int64,
+            device=z.device
+        )[:-1]
 
         iterator = self.prepare_iterator(range(self.n_steps))
         for i in iterator:
@@ -69,7 +71,7 @@ class DDIMSampler(BaseSampler):
             alpha_t_ = torch.sqrt(t.alpha_sq).to(z.dtype)
             sigma_t_ = torch.sqrt(t.sigma_sq).to(z.dtype)
             x0_pred = (z - sigma_t_ * eps_pred) / alpha_t_
-            if clip_latent:
+            if self.clip_latent:
                 x0_pred = torch.clip(x0_pred, -1, 1)
 
             if i < self.n_steps - 1:
@@ -85,7 +87,7 @@ class DDIMSampler(BaseSampler):
         return z
     
 
-class EulerSampler(BaseSampler):
+class RectifiedFlowEulerSampler(BaseSampler):
     pred_type = 'velocity'
 
     @torch.no_grad()
@@ -93,7 +95,7 @@ class EulerSampler(BaseSampler):
             self,
             z: torch.Tensor,
             scheduler: RectifiedFlowScheduler,
-            pred_fn: Callable[..., torch.Tensor],
+            pred_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     ):
         t_steps = torch.linspace(
             scheduler.n_steps - 1, 0,
@@ -122,7 +124,7 @@ if __name__ == '__main__':
     from diffusion.scheduler import RectifiedFlowScheduler
 
     scheduler = RectifiedFlowScheduler(n_steps=1000)
-    sampler = EulerSampler(n_steps=50)
+    sampler = RectifiedFlowEulerSampler(n_steps=50)
     z = torch.randn(2, 3)
     pred_fn = lambda x, t: torch.randn_like(x)
     samples = sampler.sample(z, scheduler, pred_fn)

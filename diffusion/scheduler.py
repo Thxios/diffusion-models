@@ -15,6 +15,21 @@ def get_scheduler(name, **kwargs):
         raise ValueError(f'unknown scheduler type {name}')
 
 
+class BaseScheduler:
+    pred_type = 'noise'
+
+    def get_loss(self, x: torch.Tensor, **kwargs):
+        raise NotImplementedError()
+
+    def diffuse(
+            self,
+            x: torch.Tensor,
+            eps: torch.Tensor,
+            t: torch.Tensor,
+    ):
+        raise NotImplementedError()
+    
+
 @dataclass
 class VPSchedule:
     alpha_sq: torch.Tensor
@@ -37,21 +52,6 @@ class VPSchedule:
             sigma_sq=1 - alpha_sq,
             log_snr=log_snr
         )
-    
-
-class BaseScheduler:
-    pred_type = 'noise'
-
-    def get_loss(self, x: torch.Tensor, **kwargs):
-        raise NotImplementedError()
-
-    def diffuse(
-            self,
-            x: torch.Tensor,
-            eps: torch.Tensor,
-            t: torch.Tensor,
-    ):
-        raise NotImplementedError()
     
 
 class VariancePreservingScheduler(BaseScheduler):
@@ -84,9 +84,7 @@ class BetaScheduler(VariancePreservingScheduler):
             n_steps=1000,
     ):
         if schedule == 'linear':
-            beta = torch.linspace(beta_start, beta_end,
-                                  steps=n_steps,
-                                  dtype=torch.float64)
+            beta = torch.linspace(beta_start, beta_end, steps=n_steps, dtype=torch.float64)
         elif schedule == 'cosine':
             beta = self.alpha_cosine(cos_s, cos_max_beta, n_steps)
         else:
@@ -143,7 +141,6 @@ class RectifiedFlowScheduler(BaseScheduler):
 
         loss = F.mse_loss(v_pred, x - eps)
         return loss
-
         
     def diffuse(self, x, t, eps):
         shape = (-1,) + (1,) * (len(x.shape) - 1)
