@@ -9,7 +9,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torchvision.datasets import CIFAR10, MNIST
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 import torchvision.transforms as T
 from torchvision.utils import make_grid
 import json
@@ -24,6 +24,10 @@ from diffusion.scheduler import get_scheduler, BaseScheduler
 from diffusion.sampler import get_sampler, BaseSampler
 from modeling import get_model
 from utils import count_parameters, get_augmentations
+from utils.fid import load_hidden_parameters, calculate_frechet_distance, \
+    calc_inception_features, inception_features_to_hidden_parameters
+from utils.fid_infinity import fid_extrapolation
+from utils.validate_memo import calc_memorization_metric
 
 
 WANDB_PROJECT_NAME = 'noh-diffusion'
@@ -43,6 +47,16 @@ class TrainArgs:
     guidance_scale: float = 1.0
     # save_limits: Optional[int] = None
 
+    fid_eval_steps: Optional[int] = None
+    fid_ema: bool = True
+    fid_reference_dataset: str = 'mnist-train'
+    fid_n_examples: int = 10000
+    generation_batch_size: int = 256
+    inception_batch_size: int = 512
+    adjust_fid_n: bool = True
+    fid_adjust_subsets: List[int] = dataclasses.field(
+        default_factory=lambda: [4000, 6000, 8000, 10000])
+
     batch_size: int = 64
     lr: float = 2e-4
     # lr_scheduler: Optional[str] = None
@@ -51,7 +65,7 @@ class TrainArgs:
     adam_betas: Tuple[float, float] = (0.9, 0.99)
     clip_grad_norm: float = 1.0
 
-    use_ema: bool = False
+    use_ema: bool = True
     ema_inv_gamma: float = 1.0
     ema_power: float = 0.75
 
@@ -97,38 +111,49 @@ def load_dataset(dataset, data_dir, train=True, augumentations: Optional[List[st
     transform = T.Compose(transform)
 
     if dataset == 'cifar10':
-        dataset = CIFAR10(data_dir,
-                          transform=transform,
-                          download=True,
-                          train=train)
+        dataset = CIFAR10(
+            data_dir,
+            transform=transform,
+            download=True,
+            train=train
+        )
+        data_tensor = torch.from_numpy(dataset.data).to(torch.float32).permute(0, 3, 1, 2)
+        data_tensor = data_tensor / 127.5 - 1  # scale to [-1, 1]
     elif dataset == 'mnist':
-        dataset = MNIST(data_dir,
-                        transform=transform,
-                        download=True,
-                        train=train)
+        dataset = MNIST(
+            data_dir,
+            transform=transform,
+            download=True,
+            train=train
+        )
+        data_tensor = dataset.data.unsqueeze(1).to(torch.float32)  # (N, 1, H, W)
+        data_tensor = data_tensor / 127.5 - 1  # scale to [-1, 1]
     else:
         raise ValueError(f'unknown dataset {dataset}')
     
-    return dataset
+    return dataset, data_tensor
 
 
-def get_eps_pred_func(model, cls=None, guidance_scale=1.0):
-    def pred_fn(z, t):
-        if guidance_scale == 1.0 and cls is not None:
-            eps_pred = model(z, t, cls=cls)
-        elif guidance_scale != 0 and cls is not None:
-            z = torch.cat([z, z], dim=0)
-            t = torch.cat([t, t], dim=0)
-            cls_cond = torch.cat([cls, cls], dim=0)
-            uncond_mask = torch.cat([torch.ones_like(cls), torch.zeros_like(cls)], dim=0)
+def make_generation_seed(dataset, n_examples, seed=None, sample_labels=False):
+    def get_generator():
+        return torch.Generator().manual_seed(seed) if seed is not None else None
+    
+    if dataset == 'mnist':
+        image_shape = (1, 28, 28)
+        n_classes = 10
+    elif dataset == 'cifar10':
+        image_shape = (3, 32, 32)
+        n_classes = 10
+    else:
+        raise ValueError(f'unknown dataset {dataset}')
+    
+    z = torch.randn((n_examples, *image_shape), generator=get_generator())
+    if sample_labels:
+        cls = torch.randint(0, n_classes, (n_examples,), generator=get_generator())
+    else:
+        cls = torch.arange(n_examples) % n_classes
 
-            eps_pred = model(z, t, cls=cls_cond, uncond_mask=uncond_mask)
-            eps_uncond, eps_cond = torch.chunk(eps_pred, 2, dim=0)
-            eps_pred = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
-        else:
-            eps_pred = model(z, t, cls=cls)
-        return eps_pred
-    return pred_fn
+    return {'z': z, 'cls': cls}
 
 
 class Trainer:
@@ -139,6 +164,7 @@ class Trainer:
             scheduler: Type[BaseScheduler],
             sampler: Optional[Type[BaseSampler]] = None,
             resume_ckpt_dir: Optional[str] = None,
+            overwrite: bool = False,
     ):
         if arg.dataloader_num_workers == 0:
             warnings.warn(f'set dataloader_num_workers > 0 for reproducibility')
@@ -157,10 +183,13 @@ class Trainer:
                 f'resume_ckpt_dir "{resume_ckpt_dir}" does not match arg.output_dir "{self.arg.output_dir}"'
         else:
             if os.path.exists(self.arg.output_dir) and len(os.listdir(self.arg.output_dir)) > 0:
-                overwrite_msj = f'"{self.arg.output_dir}" already exists and is not empty, overwrite? (Y/n): '
-                user_input = input(overwrite_msj)
-                if user_input.lower().strip() != 'y':
-                    raise ValueError(f'"{self.arg.output_dir}" already exists and is not empty')
+                if not overwrite:
+                    overwrite_msj = f'\n"{self.arg.output_dir}" already exists and is not empty, overwrite? (Y/n): '
+                    user_input = input(overwrite_msj)
+                    if user_input.lower().strip() != 'y':
+                        raise ValueError(f'"{self.arg.output_dir}" already exists and is not empty')
+                    
+                print(f'overwriting "{self.arg.output_dir}"...\n')
                 shutil.rmtree(self.arg.output_dir)
 
         self.wandb_run = None
@@ -188,13 +217,36 @@ class Trainer:
         self.steps_in_epoch = 0
         self.epochs = 0
 
-        self.dataset = self.get_train_dataset()
+        self.dataset, self.train_data_tensor = self.get_train_dataset()
         self.dataloader = self.get_train_dataloader()
         self.steps_per_epoch = len(self.dataloader)
         print(f'steps per epoch: {self.steps_per_epoch}')
-        self.optimizer = self.get_optimizer()
 
-        self.eval_examples = self.get_eval_examples(self.arg.seed)
+        self.optimizer = self.get_optimizer()
+        self.eval_seed = make_generation_seed(
+            self.arg.dataset,
+            self.arg.eval_n_examples, 
+            seed=self.arg.seed,
+            sample_labels=False,
+        )
+
+        self.fid_seed = None
+        self.fid_refence = None
+        if self.arg.fid_eval_steps is not None:
+            if self.arg.adjust_fid_n:
+                assert self.arg.fid_n_examples == max(self.arg.fid_adjust_subsets), \
+                    f'fid_n_examples must be equal to max(adjust_subsets) for FID extrapolation'
+                self.arg.fid_adjust_subsets.sort()
+                
+            fid_seed = make_generation_seed(
+                self.arg.dataset, 
+                self.arg.fid_n_examples, 
+                seed=self.arg.seed,
+                sample_labels=True,
+            )
+            self.fid_seed = TensorDataset(fid_seed['z'], fid_seed['cls'])
+            self.fid_refence = load_hidden_parameters(self.arg.fid_reference_dataset, save=False)
+
 
         self.model.to(self.device)
 
@@ -202,7 +254,6 @@ class Trainer:
         if self.arg.save_steps is not None:
             self.ckpt_base_dir = os.path.join(self.arg.output_dir, 'ckpts')
         self.saved_ckpt_paths = []
-
 
     def get_optimizer(self):
         if self.arg.optimizer == 'adam':
@@ -221,14 +272,14 @@ class Trainer:
         return optim
 
     def get_train_dataset(self):
-        dataset = load_dataset(
+        dataset, data_tensor = load_dataset(
             self.arg.dataset,
             self.arg.dataset_dir, 
             train=True,
             augumentations=self.arg.augmentations
         )
         print(f'dataset ready: {dataset}')
-        return dataset
+        return dataset, data_tensor
 
     def get_train_dataloader(self, dataset=None):
         if dataset is None:
@@ -280,7 +331,6 @@ class Trainer:
             self.ema_model.restore(self.model.parameters())
 
         print(f'saved ckpt {ckpt_dir}')
-    
 
     def save_latest_ckpt(self):
         latest_ckpt_path = os.path.join(self.arg.output_dir, 'latest.pt')
@@ -298,25 +348,6 @@ class Trainer:
         if self.ema_model is not None:
             ckpt['ema_model_state_dict'] = self.ema_model.state_dict()
         torch.save(ckpt, latest_ckpt_path)
-
-    def load_ckpt_legacy(self, ckpt_dir):
-        steps = torch.load(os.path.join(ckpt_dir, 'global_steps.pt'))
-        self.global_steps = steps['global_steps']
-        self.epochs = steps['epochs']
-        self.steps_in_epoch = steps['steps_in_epoch']
-
-        self.model.load_state_dict(torch.load(os.path.join(ckpt_dir, 'model.pt')))
-        self.optimizer.load_state_dict(torch.load(os.path.join(ckpt_dir, 'optimizer.pt')))
-        if self.ema_model is not None:
-            self.ema_model.load_state_dict(torch.load(os.path.join(ckpt_dir, 'ema_model.pt')))
-
-        random_states = torch.load(os.path.join(ckpt_dir, 'random_states.pt'))
-        torch.set_rng_state(random_states['rng_state'])
-        torch.cuda.set_rng_state(random_states['cuda_rng_state'])
-        np.random.set_state(random_states['np_rng_state'])
-        rd.setstate(random_states['rd_rng_state'])
-
-        print(f'loaded ckpt {ckpt_dir}')
     
     def load_latest_ckpt(self, ckpt_dir):
         latest_ckpt_path = os.path.join(ckpt_dir, 'latest.pt')
@@ -368,57 +399,97 @@ class Trainer:
 
         return loss.item()
     
-    def get_eval_examples(self, seed=None):
-        gen = torch.Generator(device=self.device)
-        if seed is not None:
-            gen.manual_seed(seed)
-        
-        if self.arg.dataset == 'mnist':
-            image_shape = (1, 28, 28)
-            n_classes = 10
-        elif self.arg.dataset == 'cifar10':
-            image_shape = (3, 32, 32)
-            n_classes = 10
-        else:
-            raise ValueError(f'unknown dataset {self.arg.dataset}')
-        
-        z = torch.randn((self.arg.eval_n_examples, *image_shape), device=self.device, generator=gen)
-        cls = torch.arange(self.arg.eval_n_examples, device=self.device) % n_classes
-
-        return {'z': z, 'cls': cls}
-    
+    @torch.no_grad()
     def generate_eval_examples(self):
         self.model.eval()
-        
-        pred_fn = get_eps_pred_func(
-            self.model, 
-            cls=self.eval_examples['cls'], 
-            guidance_scale=self.arg.guidance_scale
-        )
 
-        with torch.no_grad():
-            samples = self.sampler.sample(
-                self.eval_examples['z'],
-                self.scheduler,
-                pred_fn
-            ).cpu()
+        z, cls = self.eval_seed['z'].to(self.device), self.eval_seed['cls'].to(self.device)
+        pred_fn = self.model.get_pred_fn(cond=cls, guidance_scale=self.arg.guidance_scale)
+        samples = self.sampler.sample(z, self.scheduler, pred_fn)
+        samples = torch.clip(samples, -1, 1).cpu()
         ret = {'examples': samples}
         
         if self.ema_model is not None:
             self.ema_model.store(self.model.parameters())
             self.ema_model.copy_to(self.model.parameters())
 
-            with torch.no_grad():
-                ema_samples = self.sampler.sample(
-                    self.eval_examples['z'],
-                    self.scheduler,
-                    pred_fn
-                ).cpu()
+            ema_samples = self.sampler.sample(z, self.scheduler, pred_fn)
+            ema_samples = torch.clip(ema_samples, -1, 1).cpu()
             ret['ema_examples'] = ema_samples
 
             self.ema_model.restore(self.model.parameters())
 
         return ret
+    
+    @torch.no_grad()
+    def generate_fid_samples(self):
+        self.model.eval()
+        
+        dataloader = DataLoader(
+            self.fid_seed, 
+            num_workers=1, 
+            batch_size=self.arg.generation_batch_size, 
+            shuffle=False, 
+            drop_last=False
+        )
+        generated = []
+
+        if self.arg.fid_ema and self.ema_model is not None:
+            self.ema_model.store(self.model.parameters())
+            self.ema_model.copy_to(self.model.parameters())
+
+        for z, cls in tqdm.tqdm(dataloader, leave=False, desc='generating fid samples'):
+            z, cls = z.to(self.device), cls.to(self.device)
+            pred_fn = self.model.get_pred_fn(cond=cls, guidance_scale=self.arg.guidance_scale)
+            samples = self.sampler.sample(z, self.scheduler, pred_fn)
+            samples = torch.clip(samples, -1, 1).cpu()
+            generated.append(samples)
+        
+        if self.arg.fid_ema and self.ema_model is not None:
+            self.ema_model.restore(self.model.parameters())
+        
+        generated = torch.cat(generated, dim=0)
+        return generated
+
+    def evaluate_fid(self):
+        generated = self.generate_fid_samples()
+        inception_features = calc_inception_features(
+            generated,
+            batch_size=self.arg.inception_batch_size,
+            device=self.device,
+        )
+
+        ret = {}
+        if self.arg.adjust_fid_n:
+            fid_result = fid_extrapolation(
+                inception_features,
+                ref_mu=self.fid_refence[0],
+                ref_sigma=self.fid_refence[1],
+                subset_sizes=self.arg.fid_adjust_subsets,
+                target_n=50_000,
+            )
+            ret['FID'] = fid_result['fids'][-1]
+            ret['FID@inf'] = fid_result['fid_infinity']
+            ret['FID@50k'] = fid_result['fid_target']
+        else:
+            mu, sigma = inception_features_to_hidden_parameters(inception_features)
+            fid = calculate_frechet_distance(mu, sigma, self.fid_refence[0], self.fid_refence[1])
+            ret['FID'] = fid.item()
+
+        mem_ratio, *_ = calc_memorization_metric(
+            generated,
+            self.train_data_tensor,
+            device=self.device,
+        )
+        ret['memorization_ratio'] = mem_ratio.item()
+        print(f'evaluated FID: {ret["FID"]:.4f}, memorization_ratio: {ret["memorization_ratio"]:.4f}')
+
+        with open(os.path.join(self.arg.output_dir, 'fid_evaluations.jsonl'), 'a') as f:
+            ret_with_steps = dict(steps=self.global_steps, **ret)
+            f.write(json.dumps(ret_with_steps) + '\n')
+
+        if self.wandb_run is not None:
+            self.wandb_run.log(ret, step=self.global_steps)
 
 
     def evaluate(self, steps):
@@ -500,6 +571,10 @@ class Trainer:
                         ckpt_dir = os.path.join(self.ckpt_base_dir, f'ckpt-{self.global_steps:06d}')
                         self.save_ckpt(ckpt_dir)
                         self.save_latest_ckpt()
+                    
+                    if self.arg.fid_eval_steps is not None and self.global_steps % self.arg.fid_eval_steps == 0:
+                        self.evaluate_fid()
+                        self.model.train()
 
                     if self.global_steps >= self.arg.max_steps:
                         break
@@ -512,6 +587,7 @@ class Trainer:
 def main(
         train_arg_json: Optional[str] = None,
         resume_ckpt_dir: Optional[str] = None,
+        overwrite: bool = False,
 ):
     assert train_arg_json is not None or resume_ckpt_dir is not None
     if resume_ckpt_dir is not None:
@@ -533,7 +609,14 @@ def main(
 
     print(f'params: {count_parameters(model) / 1e+6}')
 
-    trainer = Trainer(train_args, model, scheduler, sampler, resume_ckpt_dir=resume_ckpt_dir)
+    trainer = Trainer(
+        train_args, 
+        model, 
+        scheduler, 
+        sampler, 
+        resume_ckpt_dir=resume_ckpt_dir, 
+        overwrite=overwrite
+        )
     trainer.train()
 
 

@@ -1,5 +1,5 @@
 
-from predictor import BasePredictor
+from modeling.predictor import BasePredictor
 from modeling.unet import UNet
 
 
