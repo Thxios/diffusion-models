@@ -18,15 +18,10 @@ def get_scheduler(name, **kwargs):
 class BaseScheduler:
     pred_type = 'noise'
 
-    def get_loss(self, x: torch.Tensor, **kwargs):
+    def get_loss(self, x: torch.Tensor, model, **model_call_kwargs):
         raise NotImplementedError()
 
-    def diffuse(
-            self,
-            x: torch.Tensor,
-            eps: torch.Tensor,
-            t: torch.Tensor,
-    ):
+    def diffuse(self, x: torch.Tensor, eps: torch.Tensor, t: torch.Tensor):
         raise NotImplementedError()
     
 
@@ -44,6 +39,7 @@ class VPSchedule:
             sigma_sq=sigma_sq,
             log_snr=torch.log(alpha_sq / sigma_sq)
         )
+
     @staticmethod
     def from_log_snr(log_snr):
         alpha_sq = torch.sigmoid(log_snr)
@@ -57,20 +53,30 @@ class VPSchedule:
 class VariancePreservingScheduler(BaseScheduler):
     def __init__(self, n_steps):
         self.n_steps = n_steps
+
+    def get_schedule(self, t: torch.LongTensor) -> VPSchedule:
+        raise NotImplementedError()
         
-    def get_loss(self, x, pred_fn: Callable, **kwargs):
+    def get_loss(self, x: torch.Tensor, model, **model_call_kwargs):
         # noise prediction
         eps = torch.randn_like(x)
         t = torch.randint(0, self.n_steps, size=(x.size(0),), device=x.device)
 
         x_t = self.diffuse(x, t, eps)
-        eps_pred = pred_fn(x_t, t, **kwargs)
+        eps_pred = model(x_t, t, **model_call_kwargs)
 
         loss = F.mse_loss(eps_pred, eps)
         return loss
 
-    def get_schedule(self, t: torch.LongTensor) -> VPSchedule:
-        raise NotImplementedError()
+    def diffuse(self, x, t, eps):
+        schedule = self.get_schedule(t)
+
+        shape = (-1,) + (1,) * (len(x.shape) - 1)
+        alpha_ = torch.sqrt(schedule.alpha_sq).to(dtype=x.dtype, device=x.device).view(*shape)
+        sigma_ = torch.sqrt(schedule.sigma_sq).to(dtype=x.dtype, device=x.device).view(*shape)
+
+        x_t = alpha_ * x + sigma_ * eps
+        return x_t
 
 
 class BetaScheduler(VariancePreservingScheduler):
@@ -98,16 +104,6 @@ class BetaScheduler(VariancePreservingScheduler):
         alpha_sq = self.alpha_sq.to(t.device)[t]
         return VPSchedule.from_alpha_sq(alpha_sq)
 
-    def diffuse(self, x, t, eps):
-        schedule = self.get_schedule(t)
-
-        shape = (-1,) + (1,) * (len(x.shape) - 1)
-        alpha_ = torch.sqrt(schedule.alpha_sq).to(dtype=x.dtype, device=x.device).view(*shape)
-        sigma_ = torch.sqrt(schedule.sigma_sq).to(dtype=x.dtype, device=x.device).view(*shape)
-
-        x_t = alpha_ * x + sigma_ * eps
-        return x_t
-
     @staticmethod
     def alpha_cosine(s=0.008, max_beta=0.999, n_steps=1000):
         def alpha_bar_fn(t):
@@ -131,13 +127,13 @@ class RectifiedFlowScheduler(BaseScheduler):
         self.n_steps = n_steps
         self.sigmas = torch.linspace(1, n_steps, steps=n_steps) / n_steps
     
-    def get_loss(self, x, pred_fn: Callable, **kwargs):
+    def get_loss(self, x, model, **model_call_kwargs):
         # velocity prediction
         eps = torch.randn_like(x)
         t = torch.randint(0, self.n_steps, size=(x.size(0),), device=x.device)
 
         x_t = self.diffuse(x, t, eps)
-        v_pred = pred_fn(x_t, t, **kwargs)
+        v_pred = model(x_t, t, **model_call_kwargs)
 
         loss = F.mse_loss(v_pred, x - eps)
         return loss
