@@ -27,12 +27,12 @@ REFERENCE_FILES = {
 }
 
 
-def load_hidden_parameters(dataset, **kwargs):
+def load_hidden_parameters(dataset, save=True, **kwargs):
     assert dataset in REFERENCE_FILES, f'unsupported dataset: {dataset}'
 
     reference_file = os.path.join(REFERENCE_FILES_DIR, REFERENCE_FILES[dataset])
     print(reference_file)
-    if not os.path.exists(reference_file):
+    if not os.path.exists(reference_file) and save:
         print(f'{reference_file} not found. calculating and saving hidden parameters of {dataset}...')
         save_hidden_parameters(dataset, **kwargs)
 
@@ -41,7 +41,7 @@ def load_hidden_parameters(dataset, **kwargs):
 
 
 @torch.no_grad()
-def calc_hidden_parameters(
+def calc_inception_features(
         images: torch.Tensor,  # (N, C, H, W), in range [-1, 1]
         batch_size=256,
         device='cpu',
@@ -63,21 +63,40 @@ def calc_hidden_parameters(
     pb_kwargs = {'leave': False, 'desc': 'inception'}
     if pbar_kwargs is not None:
         pb_kwargs.update(pbar_kwargs)
-    if pbar:
-        iterator = tqdm.tqdm(loader, **pb_kwargs)
-    else:
-        iterator = loader
+    iterator = tqdm.tqdm(loader, **pb_kwargs) if pbar else loader
 
     hiddens = []
     for x, *_ in iterator:
         x = x.to(device)
-        out = model(x)[0].squeeze().cpu().numpy()
+        out = model(x)[0].squeeze().cpu()
         hiddens.append(out)
 
-    hiddens = np.concatenate(hiddens, axis=0)
-    hiddens = hiddens.astype(np.float64)
-    mu = np.mean(hiddens, axis=0)
-    sigma = np.cov(hiddens, rowvar=False)
+    hiddens = torch.cat(hiddens, dim=0)
+    return hiddens
+
+@torch.no_grad()
+def inception_features_to_hidden_parameters(features: torch.Tensor):
+    features = features.to(dtype=torch.float64)
+    mu = torch.mean(features, dim=0).cpu().numpy()
+    sigma = torch.cov(features.T).cpu().numpy()
+    return mu, sigma
+
+
+def calc_hidden_parameters(
+        images: torch.Tensor,  # (N, C, H, W), in range [-1, 1]
+        batch_size=256,
+        device='cpu',
+        pbar=True,
+        pbar_kwargs=None,
+):
+    features = calc_inception_features(
+        images,
+        batch_size=batch_size,
+        device=device,
+        pbar=pbar,
+        pbar_kwargs=pbar_kwargs,
+    )
+    mu, sigma = inception_features_to_hidden_parameters(features)
     return mu, sigma
 
 
@@ -112,44 +131,17 @@ def save_hidden_parameters(dataset, **kwargs):
     np.savez(save_path, mu=mu, sigma=sigma)
 
 
-
-
-def calc_fid_to_reference(
-        images: torch.Tensor,
-        dataset,
-        batch_size=64,
-        device='cpu',
-):
-    mu2, sigma2 = load_hidden_parameters(dataset, batch_size=batch_size, device=device)
-    mu1, sigma1 = calc_hidden_parameters(images, batch_size=batch_size, device=device)
-    fid = calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
-    return fid
-
-
 def main():
     batch_size = 256
     device = 'cuda:5'
     for dataset in REFERENCE_FILES.keys():
-        # if os.path.exists(os.path.join(REFERENCE_FILES_DIR, REFERENCE_FILES[dataset])):
-        #     print(f'{dataset} hidden parameters already exist. skipping...')
-        #     continue
+        if os.path.exists(os.path.join(REFERENCE_FILES_DIR, REFERENCE_FILES[dataset])):
+            print(f'{dataset} hidden parameters already exist. skipping...')
+            continue
         print(f'calculating and saving hidden parameters of {dataset}...')
         save_hidden_parameters(dataset, batch_size=batch_size, device=device)
 
 
-def main2():
-    mu1, sigma1 = load_hidden_parameters('cifar10-train')
-    mu2, sigma2 = load_hidden_parameters('cifar10-test')
-    print(mu1.dtype, mu1.shape, sigma1.dtype, sigma1.shape, mu2.dtype, mu2.shape, sigma2.dtype, sigma2.shape)
-    fid_cifar = calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
-    print(f'FID between CIFAR-10 train and test: {fid_cifar}')
-
-    mu1, sigma1 = load_hidden_parameters('mnist-train')
-    mu2, sigma2 = load_hidden_parameters('mnist-test')
-    print(mu1.dtype, mu1.shape, sigma1.dtype, sigma1.shape, mu2.dtype, mu2.shape, sigma2.dtype, sigma2.shape)
-    fid_mnist = calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
-    print(f'FID between MNIST train and test: {fid_mnist}')
-
 if __name__ == '__main__':
-    main2()
+    main()
 
