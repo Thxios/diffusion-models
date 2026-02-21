@@ -3,6 +3,7 @@ import torch
 import numpy as np
 from typing import Dict, List, Optional, Union
 from scipy.stats import linregress
+from tqdm.auto import tqdm
 
 from utils.fid import calculate_frechet_distance
 
@@ -34,7 +35,7 @@ def fid_extrapolation(
     pb_kwargs = {'leave': False, 'desc': 'subset FID calculation'}
     if pbar_kwargs is not None:
         pb_kwargs.update(pbar_kwargs)
-    iterator = tqdm.tqdm(subset_sizes, **pb_kwargs) if pbar else subset_sizes
+    iterator = tqdm(subset_sizes, **pb_kwargs) if pbar else subset_sizes
 
     for n in iterator:
         indices = rng.choice(total_n, size=n, replace=False)

@@ -3,6 +3,7 @@ import os
 import glob
 import random as rd
 import numpy as np
+import pandas as pd
 import json
 from typing import List, Optional
 from tqdm.auto import tqdm
@@ -75,6 +76,10 @@ def make_generation_seed(dataset, n_examples, seed=None, sample_labels=False):
     return {'z': z, 'cls': cls}
 
 
+def pseudo_print(*args, **kwargs):
+    pass
+
+
 def main(
         ckpt_dir: str,
         ckpt_name: str,
@@ -89,6 +94,7 @@ def main(
         adjust_fid_n: bool = True,
         fid_adjust_subsets: List[int] = [4000, 6000, 8000, 10000],
         device: str = "cuda:0",
+        verbose: bool = True,
         seed: int = 42,
 ):
     # 0. Validate args
@@ -96,6 +102,7 @@ def main(
         "Maximum subset size must be equal to fid_n_examples"
     fid_adjust_subsets.sort()
     os.makedirs(os.path.dirname(output_json_path), exist_ok=True)
+    print_ = print if verbose else pseudo_print
 
     seed_everything(seed)
 
@@ -107,16 +114,14 @@ def main(
         'sampling_steps': sampling_steps,
         'fid_reference_dataset': fid_reference_dataset,
         'fid_n_examples': fid_n_examples,
-        'generation_batch_size': generation_batch_size,
-        'inception_batch_size': inception_batch_size,
         'adjust_fid_n': adjust_fid_n,
         'fid_adjust_subsets': fid_adjust_subsets,
         'seed': seed,
     }
-    print(f"Evaluating FID for checkpoint {ckpt_name} in {ckpt_dir} with settings:")
+    print_(f"Evaluating FID for checkpoint {ckpt_name} in {ckpt_dir} with settings:")
     for k, v in settings.items():
-        print(f"  {k}: {v}")
-    print()
+        print_(f"  {k}: {v}")
+    print_()
 
     # 1. Load model
     config_json_path = os.path.join(ckpt_dir, "train_args.json")
@@ -128,12 +133,12 @@ def main(
     sampler_cfg = config['sampler_cfg']
     sampler_cfg['n_steps'] = sampling_steps
     sampler = get_sampler(config['sampler_type'], **sampler_cfg)
-    print(f"loaded model: {count_parameters(model) / 1e6:.2f}M parameters")
+    print_(f"loaded model: {count_parameters(model) / 1e6:.2f}M parameters")
 
     ckpt_file = 'ema_model.pt' if use_ema else 'model.pt'
     ckpt_path = os.path.join(ckpt_dir, 'ckpts', ckpt_name, ckpt_file)
     load_result = model.load_state_dict(torch.load(ckpt_path))
-    print(load_result)
+    print_(load_result)
     model.to(device)
     model.eval()
 
@@ -144,8 +149,8 @@ def main(
     data_tensor = load_dataset_tensor(dataset, config['dataset_dir'], train=True)
     fid_refence = load_hidden_parameters(fid_reference_dataset, save=False)
 
-    print(f'fid_seed: {fid_seed}')
-    print(f'data_tensor: {data_tensor.shape}, in [{data_tensor.min():.4f}, {data_tensor.max():.4f}]')
+    print_(f'fid_seed: {fid_seed}')
+    print_(f'data_tensor: {data_tensor.shape}, in [{data_tensor.min():.4f}, {data_tensor.max():.4f}]')
 
     dataloader = DataLoader(
         fid_seed,
@@ -165,7 +170,7 @@ def main(
             samples = torch.clip(samples, -1, 1).cpu()
             generated.append(samples)
     generated = torch.cat(generated, dim=0)
-    print(f'generated: {generated.shape}')
+    print_(f'generated: {generated.shape}')
 
     # 4. Compute FID
     inception_features = calc_inception_features(
@@ -175,7 +180,7 @@ def main(
         pbar=True,
         pbar_kwargs={'leave': True},
     )
-    print(f'inception_features: {inception_features.shape}')
+    print_(f'inception_features: {inception_features.shape}')
 
     result = {}
     if adjust_fid_n:
@@ -205,7 +210,7 @@ def main(
     result['memorization_ratio'] = mem_ratio.item()
 
     # 6. Save results
-    print(f'evaluated FID: {result["FID"]:.4f}, memorization_ratio: {result["memorization_ratio"]:.4f}')
+    print_(f'evaluated FID: {result["FID"]:.4f}, memorization_ratio: {result["memorization_ratio"]:.4f}')
     with open(output_json_path, "w") as f:
         json.dump({**settings, **result}, f, indent=2)
 
@@ -213,6 +218,7 @@ def main(
 def main_all_ckpt(
         ckpt_dir: str,
         output_json_dir: str,
+        overwrite_existing: bool = False,
         use_ema: bool = True,
         guidance_scale: float = 1.0,
         sampling_steps: int = 50,
@@ -229,28 +235,46 @@ def main_all_ckpt(
     ckpt_names = [os.path.basename(p) for p in ckpt_names if os.path.isdir(p)]
     ckpt_names.sort()
 
+    output_jsons = []
     with tqdm(total=len(ckpt_names), desc="Evaluating FID") as pbar:
         for ckpt_name in ckpt_names:
             pbar.set_postfix_str(f"Checkpoint: {ckpt_name}")
 
-            output_path = os.path.join(output_json_dir, f'{ckpt_name}.json')
-            main(
-                ckpt_dir=ckpt_dir,
-                ckpt_name=ckpt_name,
-                output_json_path=output_path,
-                use_ema=use_ema,
-                guidance_scale=guidance_scale,
-                sampling_steps=sampling_steps,
-                fid_reference_dataset=fid_reference_dataset,
-                fid_n_examples=fid_n_examples,
-                generation_batch_size=generation_batch_size,
-                inception_batch_size=inception_batch_size,
-                adjust_fid_n=adjust_fid_n,
-                fid_adjust_subsets=fid_adjust_subsets,
-                device=device,
-                seed=seed,
-            )
+            output_path = os.path.join(output_json_dir, f'fid_{ckpt_name}.json')
+            if os.path.exists(output_path) and not overwrite_existing:
+                print(f"Output for checkpoint {ckpt_name} already exists at {output_path}, skipping...")
+                output_jsons.append(output_path)
+            else:
+                main(
+                    ckpt_dir=ckpt_dir,
+                    ckpt_name=ckpt_name,
+                    output_json_path=output_path,
+                    use_ema=use_ema,
+                    guidance_scale=guidance_scale,
+                    sampling_steps=sampling_steps,
+                    fid_reference_dataset=fid_reference_dataset,
+                    fid_n_examples=fid_n_examples,
+                    generation_batch_size=generation_batch_size,
+                    inception_batch_size=inception_batch_size,
+                    adjust_fid_n=adjust_fid_n,
+                    fid_adjust_subsets=fid_adjust_subsets,
+                    device=device,
+                    verbose=False,
+                    seed=seed,
+                )
             pbar.update(1)
+            output_jsons.append(output_path)
+    
+    # gather fid result jsons into one csv
+    records = []
+    for json_path in output_jsons:
+        with open(json_path, "r") as f:
+            record = json.load(f)
+            records.append(record)
+    df = pd.DataFrame(records)
+    csv_path = os.path.join(output_json_dir, 'fid_results.csv')
+    df.to_csv(csv_path, index=False)
+    print(f"Saved all FID results to {csv_path}")
 
 if __name__ == "__main__":
     # fire.Fire(main)
