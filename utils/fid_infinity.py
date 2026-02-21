@@ -13,6 +13,8 @@ def fid_extrapolation(
         ref_sigma: np.ndarray,
         subset_sizes: List[int] = [2048, 3032, 4016, 5000],
         target_n: Optional[int] = None,
+        pbar=True,
+        pbar_kwargs=None,
         seed=42,
 ):
     """
@@ -29,7 +31,12 @@ def fid_extrapolation(
     inv_n = []
     rng = np.random.default_rng(seed)
 
-    for n in subset_sizes:
+    pb_kwargs = {'leave': False, 'desc': 'subset FID calculation'}
+    if pbar_kwargs is not None:
+        pb_kwargs.update(pbar_kwargs)
+    iterator = tqdm.tqdm(subset_sizes, **pb_kwargs) if pbar else subset_sizes
+
+    for n in iterator:
         indices = rng.choice(total_n, size=n, replace=False)
         subset = features[indices]
 

@@ -1,6 +1,7 @@
 import torch
 
 
+@torch.no_grad()
 def calc_memorization_metric(generated, reference, k=1/3, batch_size=256, device='cpu'):
     n_gen = generated.size(0)
     generated = generated.view(n_gen, -1).to(device)

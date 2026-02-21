@@ -1,160 +1,214 @@
 
 import os
-import glob
+import random as rd
 import numpy as np
-import pandas as pd
 import json
-import matplotlib.pyplot as plt
-import seaborn as sns
+from typing import List, Optional
 from tqdm.auto import tqdm
 import torch
 from torch.utils.data import TensorDataset, DataLoader
+from torchvision.datasets import CIFAR10, MNIST
+import fire
 
 from modeling import get_model
-from diffusion.sampler import get_sampler
 from diffusion.scheduler import get_scheduler
-from utils.fid import load_hidden_parameters, calc_hidden_parameters, calculate_frechet_distance
+from diffusion.sampler import get_sampler
+from utils import count_parameters
+from utils.fid import load_hidden_parameters, calculate_frechet_distance, \
+    calc_inception_features, inception_features_to_hidden_parameters
+from utils.fid_infinity import fid_extrapolation
+from utils.validate_memo import calc_memorization_metric
 
 
 
-device = torch.device('cuda:2')
-print(f'using device: {device}')
-
-ref_dataset = 'cifar10-test'
-ref_mu, ref_sigma = load_hidden_parameters(ref_dataset)
-image_shape = (3, 32, 32)
-num_classes = 10
-batch_size = 256        # doubles when using guidance scale not in [0, 1]
-inception_batch_size = 512
-num_examples = 10000
-seed = 42
-
-ckpt_dir = 'outputs/rf_cifar10_base'
-print(f'loading model from {ckpt_dir}')
-with open(os.path.join(ckpt_dir, 'train_args.json'), 'r') as f:
-    train_args = json.load(f)
-
-scheduler = get_scheduler(train_args['scheduler_type'], **train_args['scheduler_cfg'])
-
-def load_model(ckpt_name, ema=True):
-    ckpt_file = 'ema_model.pt' if ema else 'model.pt'
-    ckpt_path = os.path.join(train_args['output_dir'], 'ckpts', ckpt_name, ckpt_file)
-
-    model = get_model(train_args['model_type'], **train_args['model_cfg'])
-    model.load_state_dict(torch.load(ckpt_path))
-    return model
-
-def load_sampler(**kwargs):
-    sampler_cfg = train_args['sampler_cfg'].copy()
-    sampler_cfg.update(kwargs)
-    sampler = get_sampler(train_args['sampler_type'], **sampler_cfg)
-    return sampler
-
-def generate_noise(num_examples, image_shape, num_classes, seed):
-    gen = torch.Generator().manual_seed(seed)
-    noise = torch.randn((num_examples, *image_shape), generator=gen)
-    labels = torch.randint(0, num_classes, (num_examples,), generator=gen)
-    print(f'noise: {noise.shape}, labels: {labels.shape}')
-    return noise, labels
-
-noise_dataset = TensorDataset(*generate_noise(num_examples, image_shape, num_classes, seed))
-
-def get_eps_pred_func(model, cls=None, guidance_scale=1.0):
-    def pred_fn(z, t):
-        if guidance_scale == 1.0 and cls is not None:
-            eps_pred = model(z, t, cls=cls)
-        elif guidance_scale != 0 and cls is not None:
-            z = torch.cat([z, z], dim=0)
-            t = torch.cat([t, t], dim=0)
-            cls_cond = torch.cat([cls, cls], dim=0)
-            uncond_mask = torch.cat([torch.ones_like(cls), torch.zeros_like(cls)], dim=0)
-
-            eps_pred = model(z, t, cls=cls_cond, uncond_mask=uncond_mask)
-            eps_uncond, eps_cond = torch.chunk(eps_pred, 2, dim=0)
-            eps_pred = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
-        else:
-            eps_pred = model(z, t)
-        return eps_pred
-    return pred_fn
+def seed_everything(seed: Optional[int] = None):
+    if seed is not None:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        np.random.seed(seed)
+        rd.seed(seed)
 
 
-@torch.no_grad()
-def generate_examples(
-        model_ckpt_name,
-        model_ema=True,
-        n_sampling_steps=None,
-        guidance_scale=1.0,
+def load_dataset_tensor(dataset, data_dir, train=True):
+    if dataset == 'cifar10':
+        dataset = CIFAR10(
+            data_dir,
+            download=True,
+            train=train
+        )
+        data_tensor = torch.from_numpy(dataset.data).to(torch.float32).permute(0, 3, 1, 2)
+        data_tensor = data_tensor / 127.5 - 1  # scale to [-1, 1]
+    elif dataset == 'mnist':
+        dataset = MNIST(
+            data_dir,
+            download=True,
+            train=train
+        )
+        data_tensor = dataset.data.unsqueeze(1).to(torch.float32)  # (N, 1, H, W)
+        data_tensor = data_tensor / 127.5 - 1  # scale to [-1, 1]
+    else:
+        raise ValueError(f'unknown dataset {dataset}')
+    
+    return data_tensor
+
+
+def make_generation_seed(dataset, n_examples, seed=None, sample_labels=False):
+    def get_generator():
+        return torch.Generator().manual_seed(seed) if seed is not None else None
+    
+    if dataset == 'mnist':
+        image_shape = (1, 28, 28)
+        n_classes = 10
+    elif dataset == 'cifar10':
+        image_shape = (3, 32, 32)
+        n_classes = 10
+    else:
+        raise ValueError(f'unknown dataset {dataset}')
+    
+    z = torch.randn((n_examples, *image_shape), generator=get_generator())
+    if sample_labels:
+        cls = torch.randint(0, n_classes, (n_examples,), generator=get_generator())
+    else:
+        cls = torch.arange(n_examples) % n_classes
+
+    return {'z': z, 'cls': cls}
+
+
+
+def main(
+        ckpt_dir: str,
+        ckpt_name: str,
+        output_json_path: str,
+        use_ema: bool = True,
+        guidance_scale: float = 1.0,
+        sampling_steps: int = 50,
+        fid_reference_dataset: str = 'cifar10-train',
+        fid_n_examples: int = 10000,
+        generation_batch_size: int = 256,
+        inception_batch_size: int = 512,
+        adjust_fid_n: bool = True,
+        fid_adjust_subsets: List[int] = [4000, 6000, 8000, 10000],
+        device: str = "cuda:0",
+        seed: int = 42,
 ):
-    model = load_model(model_ckpt_name, ema=model_ema)
+    # 0. Validate args
+    assert max(fid_adjust_subsets) == fid_n_examples, \
+        "Maximum subset size must be equal to fid_n_examples"
+    fid_adjust_subsets.sort()
+    os.makedirs(os.path.dirname(output_json_path), exist_ok=True)
+
+    seed_everything(seed)
+
+    settings = {
+        'ckpt_dir': ckpt_dir,
+        'ckpt_name': ckpt_name,
+        'use_ema': use_ema,
+        'guidance_scale': guidance_scale,
+        'sampling_steps': sampling_steps,
+        'fid_reference_dataset': fid_reference_dataset,
+        'fid_n_examples': fid_n_examples,
+        'generation_batch_size': generation_batch_size,
+        'inception_batch_size': inception_batch_size,
+        'adjust_fid_n': adjust_fid_n,
+        'fid_adjust_subsets': fid_adjust_subsets,
+        'seed': seed,
+    }
+    print(f"Evaluating FID for checkpoint {ckpt_name} in {ckpt_dir} with settings:")
+    for k, v in settings.items():
+        print(f"  {k}: {v}")
+    print()
+
+    # 1. Load model
+    config_json_path = os.path.join(ckpt_dir, "train_args.json")
+    with open(config_json_path, "r") as f:
+        config = json.load(f)
+    
+    model = get_model(config['model_type'], **config['model_cfg'])
+    scheduler = get_scheduler(config['scheduler_type'], **config['scheduler_cfg'])
+    sampler_cfg = config['sampler_cfg']
+    sampler_cfg['n_steps'] = sampling_steps
+    sampler = get_sampler(config['sampler_type'], **sampler_cfg)
+    print(f"loaded model: {count_parameters(model) / 1e6:.2f}M parameters")
+
+    ckpt_file = 'ema_model.pt' if use_ema else 'model.pt'
+    ckpt_path = os.path.join(ckpt_dir, 'ckpts', ckpt_name, ckpt_file)
+    load_result = model.load_state_dict(torch.load(ckpt_path))
+    print(load_result)
     model.to(device)
     model.eval()
-    
-    sampler_cfg = {'pbar': True, 'pbar_kwargs': {'position': 2, 'leave': False, 'desc': 'sampling'}}
-    if n_sampling_steps is not None:
-        sampler_cfg['n_steps'] = n_sampling_steps
-    sampler = load_sampler(**sampler_cfg)
 
-    dataloader = DataLoader(noise_dataset, num_workers=1, batch_size=batch_size, shuffle=False, drop_last=False)
+    # 2. Prepare dataset
+    dataset = config['dataset']
+    fid_seed = make_generation_seed(dataset, fid_n_examples, seed=seed, sample_labels=True)
+    fid_seed = TensorDataset(fid_seed['z'], fid_seed['cls'])
+    data_tensor = load_dataset_tensor(dataset, config['dataset_dir'], train=True)
+    fid_refence = load_hidden_parameters(fid_reference_dataset, save=False)
+
+    print(f'fid_seed: {fid_seed}')
+    print(f'data_tensor: {data_tensor.shape}, in [{data_tensor.min():.4f}, {data_tensor.max():.4f}]')
+
+    dataloader = DataLoader(
+        fid_seed,
+        batch_size=generation_batch_size,
+        shuffle=False,
+        num_workers=1,
+        drop_last=False
+    )
+
+    # 3. Generate samples
     generated = []
-    for z, cls in tqdm(dataloader, position=1, leave=False, desc='generating'):
-        z = z.to(device)
-        cls = cls.to(device)
-
-        pred_fn = get_eps_pred_func(model, cls=cls, guidance_scale=guidance_scale)
-        gen = sampler.sample(z, scheduler, pred_fn).cpu()
-        generated.append(gen)
+    with torch.no_grad():
+        for z, cls in tqdm(dataloader, desc="Generating FID samples"):
+            z, cls = z.to(device), cls.to(device)
+            pred_fn = model.get_pred_fn(cond=cls, guidance_scale=guidance_scale)
+            samples = sampler.sample(z, scheduler, pred_fn)
+            samples = torch.clip(samples, -1, 1).cpu()
+            generated.append(samples)
     generated = torch.cat(generated, dim=0)
-    return generated
+    print(f'generated: {generated.shape}')
 
-
-def calc_fid_model(
-        model_ckpt_name,
-        model_ema=True,
-        n_sampling_steps=None,
-        guidance_scale=1.0,
-): 
-    gen = generate_examples(
-        model_ckpt_name=model_ckpt_name,
-        model_ema=model_ema,
-        n_sampling_steps=n_sampling_steps,
-        guidance_scale=guidance_scale
+    # 4. Compute FID
+    inception_features = calc_inception_features(
+        generated,
+        batch_size=inception_batch_size,
+        device=device,
+        pbar=True,
+        pbar_kwargs={'leave': True},
     )
-    # print('gen shape:', gen.shape)
-    mu, sigma = calc_hidden_parameters(
-        gen, batch_size=inception_batch_size, device=device,
-        pbar=True, pbar_kwargs={'position': 1, 'leave': False, 'desc': 'inception'},
-    )
-    # print('mu:', mu[:5])
-    # print('sigma:', sigma[:5, :5])
-    fid = calculate_frechet_distance(mu, sigma, ref_mu, ref_sigma)
-    # print(f'FID: {fid:.6f}')
-    return fid
+    print(f'inception_features: {inception_features.shape}')
 
-
-
-output_dir = 'resources'
-os.makedirs(output_dir, exist_ok=True)
-output_file = 'rf_cifar_base_fid_results.csv'
-with open(os.path.join(output_dir, output_file), 'w') as f:
-    f.write('ckpt_name,ema,n_examples,seed,n_steps,guidance_scale,fid\n')
-
-ckpt_list = glob.glob(os.path.join(ckpt_dir, 'ckpts', 'ckpt-*'))
-ckpt_list.sort()
-
-with tqdm(total=len(ckpt_list)) as master_pbar:
-    for ckpt_path in ckpt_list:
-        ckpt_name = os.path.basename(ckpt_path)
-        master_pbar.set_description(f'CKPT: {ckpt_name}')
-        ema = True
-        n_steps = 50
-        guidance_scale = 1.0
-        fid = calc_fid_model(
-            model_ckpt_name=ckpt_name,
-            model_ema=ema,
-            n_sampling_steps=n_steps,
-            guidance_scale=guidance_scale,
+    result = {}
+    if adjust_fid_n:
+        fid_result = fid_extrapolation(
+            inception_features,
+            ref_mu=fid_refence[0],
+            ref_sigma=fid_refence[1],
+            subset_sizes=fid_adjust_subsets,
+            target_n=50_000,
+            pbar=True,
+            pbar_kwargs={'leave': True},
         )
-        with open(os.path.join(output_dir, output_file), 'a') as f:
-            f.write(f'{ckpt_name},{ema},{num_examples},{seed},{n_steps},{guidance_scale},{fid:.6f}\n')
-        master_pbar.update(1)
+        result['FID'] = fid_result['fids'][-1]
+        result['FID@inf'] = fid_result['fid_infinity']
+        result['FID@50k'] = fid_result['fid_target']
+    else:
+        mu, sigma = inception_features_to_hidden_parameters(inception_features)
+        fid = calculate_frechet_distance(mu, sigma, fid_refence[0], fid_refence[1])
+        result['FID'] = fid.item()
 
+    # 5. Compute memorization metric
+    mem_ratio, *_ = calc_memorization_metric(
+        generated,
+        data_tensor,
+        device=device,
+    )
+    result['memorization_ratio'] = mem_ratio.item()
+
+    # 6. Save results
+    print(f'evaluated FID: {result["FID"]:.4f}, memorization_ratio: {result["memorization_ratio"]:.4f}')
+    with open(output_json_path, "w") as f:
+        json.dump({**settings, **result}, f, indent=2)
+
+
+if __name__ == "__main__":
+    fire.Fire(main)
