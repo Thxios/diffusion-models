@@ -1,5 +1,6 @@
 
 import os
+import glob
 import random as rd
 import numpy as np
 import json
@@ -72,7 +73,6 @@ def make_generation_seed(dataset, n_examples, seed=None, sample_labels=False):
         cls = torch.arange(n_examples) % n_classes
 
     return {'z': z, 'cls': cls}
-
 
 
 def main(
@@ -210,5 +210,49 @@ def main(
         json.dump({**settings, **result}, f, indent=2)
 
 
+def main_all_ckpt(
+        ckpt_dir: str,
+        output_json_dir: str,
+        use_ema: bool = True,
+        guidance_scale: float = 1.0,
+        sampling_steps: int = 50,
+        fid_reference_dataset: str = 'cifar10-train',
+        fid_n_examples: int = 10000,
+        generation_batch_size: int = 256,
+        inception_batch_size: int = 512,
+        adjust_fid_n: bool = True,
+        fid_adjust_subsets: List[int] = [4000, 6000, 8000, 10000],
+        device: str = "cuda:0",
+        seed: int = 42,
+):
+    ckpt_names = glob.glob(os.path.join(ckpt_dir, 'ckpts', '*'))
+    ckpt_names = [os.path.basename(p) for p in ckpt_names if os.path.isdir(p)]
+    ckpt_names.sort()
+
+    with tqdm(total=len(ckpt_names), desc="Evaluating FID") as pbar:
+        for ckpt_name in ckpt_names:
+            pbar.set_postfix_str(f"Checkpoint: {ckpt_name}")
+
+            output_path = os.path.join(output_json_dir, f'{ckpt_name}.json')
+            main(
+                ckpt_dir=ckpt_dir,
+                ckpt_name=ckpt_name,
+                output_json_path=output_path,
+                use_ema=use_ema,
+                guidance_scale=guidance_scale,
+                sampling_steps=sampling_steps,
+                fid_reference_dataset=fid_reference_dataset,
+                fid_n_examples=fid_n_examples,
+                generation_batch_size=generation_batch_size,
+                inception_batch_size=inception_batch_size,
+                adjust_fid_n=adjust_fid_n,
+                fid_adjust_subsets=fid_adjust_subsets,
+                device=device,
+                seed=seed,
+            )
+            pbar.update(1)
+
 if __name__ == "__main__":
-    fire.Fire(main)
+    # fire.Fire(main)
+    fire.Fire(main_all_ckpt)
+
