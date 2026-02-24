@@ -2,13 +2,16 @@
 
 import torch
 import tqdm.auto as tqdm
-from typing import Callable
+from typing import Callable, Optional
 
-from diffusion.scheduler import VariancePreservingScheduler, RectifiedFlowScheduler
+from diffusion.scheduler import VariancePreservingScheduler, BetaScheduler, \
+    RectifiedFlowScheduler
 
 
 def get_sampler(name, **kwargs):
-    if name == 'ddim':
+    if name == 'ddpm':
+        return DDPMSampler(**kwargs)
+    elif name == 'ddim':
         return DDIMSampler(**kwargs)
     elif name == 'euler':
         return RectifiedFlowEulerSampler(**kwargs)
@@ -39,6 +42,50 @@ class BaseSampler:
             **kwargs
     ):
         raise NotImplementedError()
+
+
+class DDPMSampler(BaseSampler):
+    def __init__(self, n_steps, clip_latent=True, pbar=False, pbar_kwargs=None):
+        super().__init__(n_steps, pbar, pbar_kwargs)
+        self.clip_latent = clip_latent
+    
+    @torch.no_grad()
+    def sample(
+            self,
+            z: torch.Tensor,
+            scheduler: BetaScheduler,
+            pred_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+            seed: Optional[int] = None
+    ):
+        gen = torch.Generator(device=z.device)
+        if seed is not None:
+            gen.manual_seed(seed)
+
+        t_steps = torch.linspace(
+            scheduler.n_steps - 1, 0,
+            steps=self.n_steps + 1,
+            dtype=torch.int64,
+            device=z.device
+        )[:-1]
+
+        # align notation with ddpm paper
+        beta = scheduler.beta.to(device=z.device, dtype=z.dtype)  # beta_t
+        coef = beta / torch.sqrt(1 - scheduler.alpha_sq).to(device=z.device, dtype=z.dtype)
+          # (1 - alpha_t) / sqrt(1 - alpha_bar_t)
+        inv_alpha_t_sqrt = 1 / torch.sqrt(1 - beta)
+        sigma_t = torch.sqrt(beta)
+
+        iterator = self.prepare_iterator(range(self.n_steps))
+        for i in iterator:
+            t = t_steps[i]
+            eps_pred = pred_fn(z, t.repeat(z.size(0)))
+            z = inv_alpha_t_sqrt[t] * (z - coef[t] * eps_pred)
+            
+            if i < self.n_steps - 1:
+                noise = torch.randn_like(z, generator=gen)
+                z = z + sigma_t[t] * noise
+
+        return z
 
 
 

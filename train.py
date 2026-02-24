@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torchvision.datasets import CIFAR10, MNIST
 from torch.utils.data import DataLoader, TensorDataset
 import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 from torchvision.utils import make_grid
 import json
 import tqdm.auto as tqdm
@@ -222,6 +223,9 @@ class Trainer:
         self.steps_per_epoch = len(self.dataloader)
         print(f'steps per epoch: {self.steps_per_epoch}')
 
+        self.valid_dataset = self.get_valid_dataset()
+        self.valid_dataloader = self.get_valid_dataloader()
+
         self.optimizer = self.get_optimizer()
         self.eval_seed = make_generation_seed(
             self.arg.dataset,
@@ -280,6 +284,15 @@ class Trainer:
         )
         print(f'dataset ready: {dataset}')
         return dataset, data_tensor
+    
+    def get_valid_dataset(self):
+        dataset, _ = load_dataset(
+            self.arg.dataset,
+            self.arg.dataset_dir, 
+            train=False,
+        )
+        print(f'validation dataset ready: {dataset}')
+        return dataset
 
     def get_train_dataloader(self, dataset=None):
         if dataset is None:
@@ -298,6 +311,18 @@ class Trainer:
             generator=rng,
         )
         print(f'dataloader ready')
+        return loader
+    
+    def get_valid_dataloader(self):
+        loader = DataLoader(
+            self.valid_dataset,
+            batch_size=self.arg.batch_size,
+            shuffle=False,
+            drop_last=False,
+            pin_memory=self.arg.dataloader_pin_memory,
+            num_workers=self.arg.dataloader_num_workers,
+        )
+        print(f'validation dataloader ready')
         return loader
 
 
@@ -490,6 +515,20 @@ class Trainer:
 
         if self.wandb_run is not None:
             self.wandb_run.log(ret, step=self.global_steps)
+    
+    @torch.no_grad()
+    def evaluate_validation_loss(self):
+        self.model.eval()
+
+        loss_sum = 0
+        for x, cls in tqdm.tqdm(self.valid_dataloader, leave=False, desc='evaluating validation loss'):
+            batch_size = x.size(0)
+            x, cls = x.to(self.device), cls.to(self.device)
+            loss = self.scheduler.get_loss(x, self.model, cls=cls)
+            loss_sum += loss.item() * batch_size
+
+        mean_loss = loss_sum / len(self.valid_dataset)
+        return {'loss': mean_loss}
 
 
     def evaluate(self, steps):
@@ -497,21 +536,26 @@ class Trainer:
         os.makedirs(save_dir, exist_ok=True)
 
         def save_samples(samples, name):
-            grid_image = T.ToPILImage()(
+            grid_image = TF.to_pil_image(
                 make_grid(samples, nrow=10, normalize=True, value_range=(-1, 1)))
             save_path = os.path.join(save_dir, f'{steps:06d}_{name}.png')
             grid_image.save(save_path)
             return grid_image
 
         examples = self.generate_eval_examples()
-        examples = {k: save_samples(v, k) for k, v in examples.items()}
+        image_log = {}
+        for k, v in examples.items():
+            img = save_samples(v, k)
+            image_log[k] = wandb.Image(img)
+        loss_log = {f'val/{k}': v for k, v in self.evaluate_validation_loss().items()}
 
         if self.wandb_run is not None:
             logs = {
                 'global_steps': steps,
                 'epochs': steps / self.steps_per_epoch,
             }
-            logs.update(**{k: wandb.Image(v) for k, v in examples.items()})
+            logs.update(**image_log)
+            logs.update(**loss_log)
             self.wandb_run.log(logs, step=steps)
 
     def skip_previous_steps(self):
