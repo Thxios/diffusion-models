@@ -520,15 +520,24 @@ class Trainer:
     def evaluate_validation_loss(self):
         self.model.eval()
 
-        loss_sum = 0
-        for x, cls in tqdm.tqdm(self.valid_dataloader, leave=False, desc='evaluating validation loss'):
-            batch_size = x.size(0)
-            x, cls = x.to(self.device), cls.to(self.device)
-            loss = self.scheduler.get_loss(x, self.model, cls=cls)
-            loss_sum += loss.item() * batch_size
+        def get_eval_loss():
+            loss_sum = 0
+            for x, cls in tqdm.tqdm(self.valid_dataloader, leave=False, desc='evaluating validation loss'):
+                batch_size = x.size(0)
+                x, cls = x.to(self.device), cls.to(self.device)
+                loss = self.scheduler.get_loss(x, self.model, cls=cls)
+                loss_sum += loss.item() * batch_size
+            mean_loss = loss_sum / len(self.valid_dataset)
+            return mean_loss
+        
+        result = {'loss': get_eval_loss()}
+        if self.ema_model is not None:
+            self.ema_model.store(self.model.parameters())
+            self.ema_model.copy_to(self.model.parameters())
+            result['ema_loss'] = get_eval_loss()
+            self.ema_model.restore(self.model.parameters())
 
-        mean_loss = loss_sum / len(self.valid_dataset)
-        return {'loss': mean_loss}
+        return result
 
 
     def evaluate(self, steps):
