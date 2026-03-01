@@ -67,11 +67,11 @@ class Attention2D(nn.Module):
         x = self.norm(x)
         x = x.view(batch_size, n_dim, seq_len).transpose(-1, -2)
 
-        q, k, v = rearrange(
-            self.qkv_proj(x),
-            'b l (n h d) -> n b h l d',
-            n=3, h=self.n_heads, d=self.n_dim_head
-        )
+        qkv = self.qkv_proj(x)
+        qkv = qkv.view(batch_size, seq_len, 3, self.n_heads, self.n_dim_head)
+        qkv = qkv.permute(2, 0, 3, 1, 4).contiguous()
+        q, k, v = qkv.unbind(0)
+
         attn = F.scaled_dot_product_attention(
             q, k, v,
             dropout_p=self.dropout_p if self.training else 0

@@ -20,10 +20,11 @@ from typing import Optional, List, Tuple, Type
 import wandb
 import fire
 from diffusers.training_utils import EMAModel
+from transformers import get_scheduler as get_lr_scheduler
 
 from diffusion.scheduler import get_scheduler, BaseScheduler
 from diffusion.sampler import get_sampler, BaseSampler
-from modeling import get_model
+from modeling import get_model, BasePredictor
 from utils import count_parameters, get_augmentations
 from utils.fid import load_hidden_parameters, calculate_frechet_distance, \
     calc_inception_features, inception_features_to_hidden_parameters
@@ -58,10 +59,11 @@ class TrainArgs:
     fid_adjust_subsets: List[int] = dataclasses.field(
         default_factory=lambda: [4000, 6000, 8000, 10000])
 
-    batch_size: int = 64
+    batch_size: int = 128
     lr: float = 2e-4
-    # lr_scheduler: Optional[str] = None
-    # lr_warmup_steps: int = 0
+    lr_scheduler: Optional[str] = None
+    lr_warmup_steps: int = 0
+    lr_schduler_cfg: dict = dataclasses.field(default_factory=dict)
     optimizer: str = 'adamw'
     adam_betas: Tuple[float, float] = (0.9, 0.99)
     clip_grad_norm: float = 1.0
@@ -79,6 +81,7 @@ class TrainArgs:
 
     device: str = 'cuda'
     seed: int = 42
+    bf16: bool = False
 
     p_uncond: float = 0.2
     model_type: str = 'unet'
@@ -161,7 +164,7 @@ class Trainer:
     def __init__(
             self,
             arg: TrainArgs,
-            model: nn.Module,
+            model: Type[BasePredictor],
             scheduler: Type[BaseScheduler],
             sampler: Optional[Type[BaseSampler]] = None,
             resume_ckpt_dir: Optional[str] = None,
@@ -204,6 +207,7 @@ class Trainer:
         self.device = torch.device(self.arg.device)
         print(f'using device: {self.device}')
 
+        self.model.to(self.device)
         self.ema_model = None
         if self.arg.use_ema:
             self.ema_model = EMAModel(
@@ -227,6 +231,8 @@ class Trainer:
         self.valid_dataloader = self.get_valid_dataloader()
 
         self.optimizer = self.get_optimizer()
+        self.lr_scheduler = self.get_lr_scheduler(self.optimizer)
+
         self.eval_seed = make_generation_seed(
             self.arg.dataset,
             self.arg.eval_n_examples, 
@@ -251,9 +257,6 @@ class Trainer:
             self.fid_seed = TensorDataset(fid_seed['z'], fid_seed['cls'])
             self.fid_refence = load_hidden_parameters(self.arg.fid_reference_dataset, save=False)
 
-
-        self.model.to(self.device)
-
         self.ckpt_base_dir = None
         if self.arg.save_steps is not None:
             self.ckpt_base_dir = os.path.join(self.arg.output_dir, 'ckpts')
@@ -274,6 +277,18 @@ class Trainer:
         )
         print(f'optimizer ready')
         return optim
+
+    def get_lr_scheduler(self, optim):
+        if self.arg.lr_scheduler is None:
+            return None
+        lr_scheduler = get_lr_scheduler(
+            self.arg.lr_scheduler,
+            optimizer=optim,
+            num_warmup_steps=self.arg.lr_warmup_steps,
+            num_training_steps=self.arg.max_steps,
+            **self.arg.lr_schduler_cfg,
+        )
+        return lr_scheduler
 
     def get_train_dataset(self):
         dataset, data_tensor = load_dataset(
@@ -372,6 +387,8 @@ class Trainer:
         }
         if self.ema_model is not None:
             ckpt['ema_model_state_dict'] = self.ema_model.state_dict()
+        if self.lr_scheduler is not None:
+            ckpt['lr_scheduler_state_dict'] = self.lr_scheduler.state_dict()
         torch.save(ckpt, latest_ckpt_path)
     
     def load_latest_ckpt(self, ckpt_dir):
@@ -387,6 +404,8 @@ class Trainer:
         self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         if self.ema_model is not None:
             self.ema_model.load_state_dict(ckpt['ema_model_state_dict'])
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.load_state_dict(ckpt['lr_scheduler_state_dict'])
 
         torch.set_rng_state(ckpt['rng_state'])
         torch.cuda.set_rng_state(ckpt['cuda_rng_state'])
@@ -408,9 +427,15 @@ class Trainer:
 
 
     def train_on_batch(self, x, label=None):
-        uncond_mask = torch.bernoulli(self.arg.p_uncond * torch.ones_like(label))
+        uncond_mask = None
+        if label is not None:
+            uncond_mask = torch.bernoulli(self.arg.p_uncond * torch.ones_like(label))
 
-        loss = self.scheduler.get_loss(x, self.model, cls=label, uncond_mask=uncond_mask)
+        if self.arg.bf16:
+            with torch.autocast(self.device.type, dtype=torch.bfloat16):
+                loss = self.scheduler.get_loss(x, self.model, cls=label, uncond_mask=uncond_mask)
+        else:
+            loss = self.scheduler.get_loss(x, self.model, cls=label, uncond_mask=uncond_mask)
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(
@@ -418,6 +443,8 @@ class Trainer:
             self.arg.clip_grad_norm
         )
         self.optimizer.step()
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
         self.model.zero_grad()
         if self.ema_model is not None:
             self.ema_model.step(self.model.parameters())
@@ -522,10 +549,11 @@ class Trainer:
 
         def get_eval_loss():
             loss_sum = 0
+            gen = torch.Generator(device=self.device).manual_seed(self.arg.seed)
             for x, cls in tqdm.tqdm(self.valid_dataloader, leave=False, desc='evaluating validation loss'):
                 batch_size = x.size(0)
                 x, cls = x.to(self.device), cls.to(self.device)
-                loss = self.scheduler.get_loss(x, self.model, cls=cls)
+                loss = self.scheduler.get_loss(x, self.model, gen=gen, cls=cls)
                 loss_sum += loss.item() * batch_size
             mean_loss = loss_sum / len(self.valid_dataset)
             return mean_loss
@@ -577,7 +605,6 @@ class Trainer:
         return iterator
 
     def train(self):
-
         if self.resume_ckpt_dir is not None:
             self.load_latest_ckpt(self.resume_ckpt_dir)
 
@@ -588,7 +615,6 @@ class Trainer:
 
         print('train start')
 
-        losses = []
         self.model.train()
 
         with tqdm.tqdm(initial=self.global_steps, total=self.arg.max_steps) as pbar:
@@ -599,18 +625,19 @@ class Trainer:
                     x, cls = x.to(self.device), cls.to(self.device)
                     loss = self.train_on_batch(x, cls)
 
-                    losses.append(loss)
                     self.global_steps += 1
                     self.epochs = self.global_steps // self.steps_per_epoch
                     self.steps_in_epoch = self.global_steps % self.steps_per_epoch
                     pbar.update(1)
                     
                     if self.global_steps % self.arg.logging_steps == 0:
-                        loss_mean = np.mean(losses)
-                        logs = dict(loss=loss_mean)
-                        losses.clear()
-                        pbar.set_postfix({'loss': f'{loss_mean:.5f}'})
+                        pbar.set_postfix({'loss': f'{loss:.5f}'})
 
+                        logs = {'loss': loss}
+                        if self.ema_model is not None:
+                            logs['ema_decay'] = self.ema_model.cur_decay_value
+                        if self.lr_scheduler is not None:
+                            logs['lr'] = self.lr_scheduler.get_last_lr()[0]
                         self.log(
                             self.global_steps,
                             **logs
