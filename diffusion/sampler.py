@@ -28,6 +28,9 @@ class BaseSampler:
         self.pbar_kwargs = {'leave': False}
         if pbar_kwargs is not None:
             self.pbar_kwargs.update(pbar_kwargs)
+        
+    def set_steps(self, n_steps):
+        self.n_steps = n_steps
 
     def prepare_iterator(self, iterator):
         if self.pbar:
@@ -45,10 +48,6 @@ class BaseSampler:
 
 
 class DDPMSampler(BaseSampler):
-    def __init__(self, n_steps, clip_latent=True, pbar=False, pbar_kwargs=None):
-        super().__init__(n_steps, pbar, pbar_kwargs)
-        self.clip_latent = clip_latent
-    
     @torch.no_grad()
     def sample(
             self,
@@ -69,9 +68,8 @@ class DDPMSampler(BaseSampler):
         )[:-1]
 
         # align notation with ddpm paper
-        beta = scheduler.beta.to(device=z.device, dtype=z.dtype)  # beta_t
-        coef = beta / torch.sqrt(1 - scheduler.alpha_sq).to(device=z.device, dtype=z.dtype)
-          # (1 - alpha_t) / sqrt(1 - alpha_bar_t)
+        beta = scheduler.beta.to(device=z.device, dtype=z.dtype)
+        coef = beta / torch.sqrt(1 - scheduler.alpha_sq).to(device=z.device, dtype=z.dtype) # (1 - alpha_t) / sqrt(1 - alpha_bar_t)
         inv_alpha_t_sqrt = 1 / torch.sqrt(1 - beta)
         sigma_t = torch.sqrt(beta)
 

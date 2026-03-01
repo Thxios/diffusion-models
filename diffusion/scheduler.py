@@ -18,7 +18,7 @@ def get_scheduler(name, **kwargs):
 class BaseScheduler:
     pred_type = 'noise'
 
-    def get_loss(self, x: torch.Tensor, model, **model_call_kwargs):
+    def get_loss(self, x: torch.Tensor, model, gen=None, **model_call_kwargs):
         raise NotImplementedError()
 
     def diffuse(self, x: torch.Tensor, eps: torch.Tensor, t: torch.Tensor):
@@ -57,10 +57,14 @@ class VariancePreservingScheduler(BaseScheduler):
     def get_schedule(self, t: torch.LongTensor) -> VPSchedule:
         raise NotImplementedError()
         
-    def get_loss(self, x: torch.Tensor, model, **model_call_kwargs):
+    def get_loss(self, x: torch.Tensor, model, gen=None, **model_call_kwargs):
         # noise prediction
-        eps = torch.randn_like(x)
-        t = torch.randint(0, self.n_steps, size=(x.size(0),), device=x.device)
+        eps = torch.randn_like(x, generator=gen)
+        t = torch.randint(
+            0, self.n_steps, size=(x.size(0),), 
+            device=x.device,
+            generator=gen
+        )
 
         x_t = self.diffuse(x, t, eps)
         eps_pred = model(x_t, t, **model_call_kwargs)
@@ -127,10 +131,14 @@ class RectifiedFlowScheduler(BaseScheduler):
         self.n_steps = n_steps
         self.sigmas = torch.linspace(1, n_steps, steps=n_steps) / n_steps
     
-    def get_loss(self, x, model, **model_call_kwargs):
+    def get_loss(self, x, model, gen=None, **model_call_kwargs):
         # velocity prediction
-        eps = torch.randn_like(x)
-        t = torch.randint(0, self.n_steps, size=(x.size(0),), device=x.device)
+        eps = torch.randn_like(x, generator=gen)
+        t = torch.randint(
+            0, self.n_steps, size=(x.size(0),), 
+            device=x.device, 
+            generator=gen
+        )
 
         x_t = self.diffuse(x, t, eps)
         v_pred = model(x_t, t, **model_call_kwargs)
