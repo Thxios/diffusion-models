@@ -20,9 +20,9 @@ class GuidedPredictor(BasePredictor):
                 pred = self.pred_conditional(z, t, cond=cond)
             else:
                 pred = self.pred_conditional(
-                    torch.repeat_interleave(z, 2, dim=0), 
-                    torch.repeat_interleave(t, 2, dim=0), 
-                    cond=torch.repeat_interleave(cond, 2, dim=0), 
+                    torch.cat([z, z], dim=0),
+                    torch.cat([t, t], dim=0),
+                    cond=torch.cat([cond, cond], dim=0),
                     uncond_mask=torch.cat([torch.ones_like(cond), torch.zeros_like(cond)], dim=0)
                 )
                 pred_uncond, pred_cond = torch.chunk(pred, 2, dim=0)

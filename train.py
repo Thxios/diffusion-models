@@ -503,6 +503,7 @@ class Trainer:
         generated = torch.cat(generated, dim=0)
         return generated
 
+    @torch.no_grad()
     def evaluate_fid(self):
         generated = self.generate_fid_samples()
         inception_features = calc_inception_features(
@@ -700,5 +701,6 @@ def main(
     trainer.train()
 
 
+# nohup python train.py arg_json/rf_cifar_attn.json > stdouts/rf_cifar_attn &
 if __name__ == '__main__':
     fire.Fire(main)

@@ -54,12 +54,8 @@ class DDPMSampler(BaseSampler):
             z: torch.Tensor,
             scheduler: BetaScheduler,
             pred_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-            seed: Optional[int] = None
+            gen: Optional[torch.Generator] = None
     ):
-        gen = torch.Generator(device=z.device)
-        if seed is not None:
-            gen.manual_seed(seed)
-
         t_steps = torch.linspace(
             scheduler.n_steps - 1, 0,
             steps=self.n_steps + 1,
