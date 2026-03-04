@@ -457,7 +457,11 @@ class Trainer:
 
         z, cls = self.eval_seed['z'].to(self.device), self.eval_seed['cls'].to(self.device)
         pred_fn = self.model.get_pred_fn(cond=cls, guidance_scale=self.arg.guidance_scale)
-        samples = self.sampler.sample(z, self.scheduler, pred_fn)
+        if self.arg.bf16:
+            with torch.autocast(self.device.type, dtype=torch.bfloat16):
+                samples = self.sampler.sample(z, self.scheduler, pred_fn)
+        else:
+            samples = self.sampler.sample(z, self.scheduler, pred_fn)
         samples = torch.clip(samples, -1, 1).cpu()
         ret = {'examples': samples}
         
@@ -465,7 +469,11 @@ class Trainer:
             self.ema_model.store(self.model.parameters())
             self.ema_model.copy_to(self.model.parameters())
 
-            ema_samples = self.sampler.sample(z, self.scheduler, pred_fn)
+            if self.arg.bf16:
+                with torch.autocast(self.device.type, dtype=torch.bfloat16):
+                    ema_samples = self.sampler.sample(z, self.scheduler, pred_fn)
+            else:
+                ema_samples = self.sampler.sample(z, self.scheduler, pred_fn)
             ema_samples = torch.clip(ema_samples, -1, 1).cpu()
             ret['ema_examples'] = ema_samples
 
@@ -493,7 +501,13 @@ class Trainer:
         for z, cls in tqdm.tqdm(dataloader, leave=False, desc='generating fid samples'):
             z, cls = z.to(self.device), cls.to(self.device)
             pred_fn = self.model.get_pred_fn(cond=cls, guidance_scale=self.arg.guidance_scale)
-            samples = self.sampler.sample(z, self.scheduler, pred_fn)
+            
+            if self.arg.bf16:
+                with torch.autocast(self.device.type, dtype=torch.bfloat16):
+                    samples = self.sampler.sample(z, self.scheduler, pred_fn)
+            else:
+                samples = self.sampler.sample(z, self.scheduler, pred_fn)
+
             samples = torch.clip(samples, -1, 1).cpu()
             generated.append(samples)
         
@@ -554,7 +568,13 @@ class Trainer:
             for x, cls in tqdm.tqdm(self.valid_dataloader, leave=False, desc='evaluating validation loss'):
                 batch_size = x.size(0)
                 x, cls = x.to(self.device), cls.to(self.device)
-                loss = self.scheduler.get_loss(x, self.model, gen=gen, cls=cls)
+                
+                if self.arg.bf16:
+                    with torch.autocast(self.device.type, dtype=torch.bfloat16):
+                        loss = self.scheduler.get_loss(x, self.model, gen=gen, cls=cls)
+                else:
+                    loss = self.scheduler.get_loss(x, self.model, gen=gen, cls=cls)
+                    
                 loss_sum += loss.item() * batch_size
             mean_loss = loss_sum / len(self.valid_dataset)
             return mean_loss
