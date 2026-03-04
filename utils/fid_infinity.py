@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Union
 from scipy.stats import linregress
 from tqdm.auto import tqdm
 
-from utils.fid import calculate_frechet_distance
+from utils.fid import calculate_frechet_distance, inception_features_to_hidden_parameters
 
 
 def fid_extrapolation(
@@ -41,9 +41,7 @@ def fid_extrapolation(
         indices = rng.choice(total_n, size=n, replace=False)
         subset = features[indices]
 
-        mu = np.mean(subset, axis=0)
-        sigma = np.cov(subset, rowvar=False)
-        
+        mu, sigma = inception_features_to_hidden_parameters(subset)
         fid_val = calculate_frechet_distance(mu, sigma, ref_mu, ref_sigma).item()
         
         fids.append(fid_val)

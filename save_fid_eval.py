@@ -1,6 +1,7 @@
 
 import os
 import glob
+import gc
 import random as rd
 import numpy as np
 import pandas as pd
@@ -86,13 +87,14 @@ def main(
         output_json_path: str,
         use_ema: bool = True,
         guidance_scale: float = 1.0,
-        sampling_steps: int = 50,
+        sampling_steps: int = 100,
         fid_reference_dataset: str = 'cifar10-train',
         fid_n_examples: int = 10000,
         generation_batch_size: int = 256,
         inception_batch_size: int = 512,
         adjust_fid_n: bool = True,
         fid_adjust_subsets: List[int] = [4000, 6000, 8000, 10000],
+        bf16: bool = False,
         device: str = "cuda:0",
         verbose: bool = True,
         seed: int = 42,
@@ -103,6 +105,7 @@ def main(
     fid_adjust_subsets.sort()
     os.makedirs(os.path.dirname(output_json_path), exist_ok=True)
     print_ = print if verbose else pseudo_print
+    device = torch.device(device)
 
     seed_everything(seed)
 
@@ -116,6 +119,7 @@ def main(
         'fid_n_examples': fid_n_examples,
         'adjust_fid_n': adjust_fid_n,
         'fid_adjust_subsets': fid_adjust_subsets,
+        'bf16': bf16,
         'seed': seed,
     }
     print_(f"Evaluating FID for checkpoint {ckpt_name} in {ckpt_dir} with settings:")
@@ -166,11 +170,21 @@ def main(
         for z, cls in tqdm(dataloader, desc="Generating FID samples"):
             z, cls = z.to(device), cls.to(device)
             pred_fn = model.get_pred_fn(cond=cls, guidance_scale=guidance_scale)
-            samples = sampler.sample(z, scheduler, pred_fn)
+
+            if bf16:
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    samples = sampler.sample(z, scheduler, pred_fn)
+            else:
+                samples = sampler.sample(z, scheduler, pred_fn)
+
             samples = torch.clip(samples, -1, 1).cpu()
             generated.append(samples)
     generated = torch.cat(generated, dim=0)
     print_(f'generated: {generated.shape}')
+
+    del model, scheduler, sampler, dataloader, fid_seed
+    torch.cuda.empty_cache()
+    gc.collect()
 
     # 4. Compute FID
     inception_features = calc_inception_features(
@@ -196,6 +210,8 @@ def main(
         result['FID'] = fid_result['fids'][-1]
         result['FID@inf'] = fid_result['fid_infinity']
         result['FID@50k'] = fid_result['fid_target']
+        result['FIDs'] = fid_result['fids']
+        result['R^2'] = fid_result['regression']['r_squared']
     else:
         mu, sigma = inception_features_to_hidden_parameters(inception_features)
         fid = calculate_frechet_distance(mu, sigma, fid_refence[0], fid_refence[1])
@@ -221,13 +237,14 @@ def main_all_ckpt(
         overwrite_existing: bool = False,
         use_ema: bool = True,
         guidance_scale: float = 1.0,
-        sampling_steps: int = 50,
+        sampling_steps: int = 100,
         fid_reference_dataset: str = 'cifar10-train',
         fid_n_examples: int = 10000,
         generation_batch_size: int = 256,
         inception_batch_size: int = 512,
         adjust_fid_n: bool = True,
         fid_adjust_subsets: List[int] = [4000, 6000, 8000, 10000],
+        bf16: bool = False,
         device: str = "cuda:0",
         seed: int = 42,
 ):
@@ -258,6 +275,7 @@ def main_all_ckpt(
                     inception_batch_size=inception_batch_size,
                     adjust_fid_n=adjust_fid_n,
                     fid_adjust_subsets=fid_adjust_subsets,
+                    bf16=bf16,
                     device=device,
                     verbose=False,
                     seed=seed,
@@ -276,6 +294,7 @@ def main_all_ckpt(
     df.to_csv(csv_path, index=False)
     print(f"Saved all FID results to {csv_path}")
 
+# python save_fid_eval.py outputs/cos_cifar10_attn resources/cos_cifar10_attn_fid --sampling_steps 100 --guidance_scale 1.0 --fid_reference_dataset "cifar10-train" --fid_n_examples 50000 --fid_adjust_subsets "[10000,20000,30000,40000,50000]" --seed 42 --device "cuda:4"
 if __name__ == "__main__":
     # fire.Fire(main)
     fire.Fire(main_all_ckpt)

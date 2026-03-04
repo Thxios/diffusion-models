@@ -7,6 +7,7 @@ from pytorch_fid.inception import InceptionV3
 from torchvision.datasets import CIFAR10, MNIST
 from torch.utils.data import DataLoader, TensorDataset
 import tqdm.auto as tqdm
+from typing import Union
 
 from threadpoolctl import threadpool_limits
 from pytorch_fid.fid_score import calculate_frechet_distance as _calculate_frechet_distance
@@ -75,10 +76,12 @@ def calc_inception_features(
     return hiddens
 
 @torch.no_grad()
-def inception_features_to_hidden_parameters(features: torch.Tensor):
-    features = features.to(dtype=torch.float64)
-    mu = torch.mean(features, dim=0).cpu().numpy()
-    sigma = torch.cov(features.T).cpu().numpy()
+def inception_features_to_hidden_parameters(features: Union[torch.Tensor, np.ndarray]):
+    if isinstance(features, torch.Tensor):
+        features = features.cpu().numpy()
+    features = features.astype(np.float64)
+    mu = np.mean(features, axis=0)
+    sigma = np.cov(features, rowvar=False)
     return mu, sigma
 
 
