@@ -34,8 +34,8 @@ class Dynamic2DRoPE(nn.Module):
         cos_2d = torch.cat([cos_h, cos_w], dim=-1).reshape(h * w, -1)
         sin_2d = torch.cat([sin_h, sin_w], dim=-1).reshape(h * w, -1)
         
-        cos_2d = cos_2d.unsqueeze(0).unsqueeze(2).repeat_interleave(2, dim=-1)
-        sin_2d = sin_2d.unsqueeze(0).unsqueeze(2).repeat_interleave(2, dim=-1)
+        cos_2d = cos_2d.unsqueeze(0).unsqueeze(1).repeat_interleave(2, dim=-1)
+        sin_2d = sin_2d.unsqueeze(0).unsqueeze(1).repeat_interleave(2, dim=-1)
         return cos_2d, sin_2d
 
 
@@ -61,7 +61,8 @@ class PeriodicEncoding(nn.Module):
         half_dim = time_encoding_dim // 2
         freq_base = torch.arange(half_dim, dtype=torch.float32) / half_dim
         freq = torch.exp(-math.log(max_period) * freq_base)
-        self.register_buffer('freq', freq)
+        
+        self.register_buffer('freq', freq, persistent=False)
 
     def forward(self, x: torch.Tensor):
         x_f32 = x.to(torch.float32)
@@ -121,7 +122,7 @@ class SwiGLUFFNBlock(nn.Module):
 
         self.w12 = nn.Linear(hidden_size, intermediate_size * 2, bias=ffn_bias)
         self.dropout = nn.Dropout(dropout)
-        self.w3 = nn.Linear(hidden_size, intermediate_size, bias=ffn_bias)
+        self.w3 = nn.Linear(intermediate_size, hidden_size, bias=ffn_bias)
 
     def forward(self, x, cond):
         # pre_norm
@@ -170,12 +171,12 @@ class AttentionBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, cond, rope):
-        batch_size, hidden_size, seq_len = x.shape
+        batch_size, seq_len, hidden_size = x.shape
 
         # pre_norm
         hidden = self.norm(x)
-        shift, scale, gate = self.adaLN1(cond).chunk(3, dim=-1)
-        hidden = modulate(hidden, scale.unsqueeze(1), shift.unsqueeze(1))
+        shift, scale, gate = self.adaln(cond).chunk(3, dim=-1)
+        hidden = modulate(hidden, scale, shift)
 
         qkv = self.qkv_proj(hidden)
         qkv = qkv.view(batch_size, seq_len, 3, self.num_heads, -1)
@@ -326,3 +327,23 @@ class UltimateTransformer(nn.Module):
         x = x.view(batch_size, -1, height, width)
 
         return x
+
+
+if __name__ == '__main__':
+    model = UltimateTransformer(
+        in_channels=3,
+        out_channels=3,
+        num_layers=4,
+        hidden_size=256,
+        embedding_dim=256,
+        patch_size=16,
+        bottleneck_size=32,
+        intermediate_size=768,
+        num_heads=8,
+        time_encoding_dim=128,
+    )
+    x = torch.randn(2, 3, 128, 128)
+    t = torch.tensor([10, 20])
+    out = model(x, t)
+    print(out.shape)
+
