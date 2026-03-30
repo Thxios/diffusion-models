@@ -22,7 +22,8 @@ class PeriodicEncoding(nn.Module):
         self.register_buffer('freq', freq)
 
     def forward(self, x: torch.Tensor):
-        freq = x[:, None] * self.freq[None, :]
+        x_f32 = x.to(torch.float32)
+        freq = x_f32[:, None] * self.freq[None, :]
         emb = torch.cat([torch.sin(freq), torch.cos(freq)], dim=-1)
         return emb
 

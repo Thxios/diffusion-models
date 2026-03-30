@@ -1,6 +1,6 @@
 {
-  "output_dir": "outputs/rf_mnist_base",
-  "wandb_run_name": "rf_mnist_base",
+  "output_dir": "outputs/beta_mnist_2",
+  "wandb_run_name": "beta_mnist_2",
   "max_steps": 200000,
   "logging_steps": 50,
   "eval_steps": 1000,
@@ -9,6 +9,8 @@
   "guidance_scale": 1.0,
   "batch_size": 128,
   "lr": 0.0002,
+  "lr_scheduler": "constant",
+  "lr_warmup_steps": 1000,
   "optimizer": "adamw",
   "clip_grad_norm": 1.0,
   "use_ema": true,
@@ -48,17 +50,22 @@
     "embedding_dim": 64,
     "embedding_mixing": "scale_shift",
     "n_class_embeddings": 10,
-    "dropout": 0.0,
+    "dropout": 0.15,
     "downsample_use_conv": true,
     "upsample_use_conv": true
   },
-  "scheduler_type": "rectified_flow",
+  "scheduler_type": "beta",
   "scheduler_cfg": {
+    "schedule": "linear",
+    "beta_start": 0.0001,
+    "beta_end": 0.02,
     "n_steps": 1000
   },
-  "sampler_type": "euler",
+  "sampler_type": "ddim",
   "sampler_cfg": {
     "n_steps": 50,
+    "eta": 0.0,
+    "clip_latent": true,
     "pbar": true
   }
 }

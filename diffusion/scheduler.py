@@ -16,68 +16,111 @@ def get_scheduler(name, **kwargs):
 
 
 class BaseScheduler:
-    pred_type = 'noise'
-
     def get_loss(self, x: torch.Tensor, model, gen=None, **model_call_kwargs):
         raise NotImplementedError()
 
     def diffuse(self, x: torch.Tensor, eps: torch.Tensor, t: torch.Tensor):
         raise NotImplementedError()
-    
+
 
 @dataclass
-class VPSchedule:
-    alpha_sq: torch.Tensor
-    sigma_sq: torch.Tensor
+class Schedule:
+    alpha: torch.Tensor
+    sigma: torch.Tensor
     log_snr: torch.Tensor
 
+@dataclass
+class VPSchedule(Schedule):
     @staticmethod
-    def from_alpha_sq(alpha_sq):
-        sigma_sq = 1 - alpha_sq
+    def from_alpha(alpha):
+        sigma = torch.sqrt(1 - alpha ** 2)
         return VPSchedule(
-            alpha_sq=alpha_sq,
-            sigma_sq=sigma_sq,
-            log_snr=torch.log(alpha_sq / sigma_sq)
+            alpha=alpha,
+            sigma=sigma,
+            log_snr=2 * torch.log(alpha / sigma)
         )
 
     @staticmethod
     def from_log_snr(log_snr):
         alpha_sq = torch.sigmoid(log_snr)
+        alpha = torch.sqrt(alpha_sq)
+        sigma = torch.sqrt(1 - alpha_sq)
         return VPSchedule(
-            alpha_sq=alpha_sq,
-            sigma_sq=1 - alpha_sq,
+            alpha=alpha,
+            sigma=sigma,
+            log_snr=log_snr
+        )
+
+@dataclass
+class RectFlowSchedule(Schedule):
+    @staticmethod
+    def from_alpha(alpha):
+        sigma = 1 - alpha
+        return RectFlowSchedule(
+            alpha=alpha,
+            sigma=sigma,
+            log_snr=2 * torch.log(alpha / sigma)
+        )
+
+    @staticmethod
+    def from_log_snr(log_snr):
+        alpha_sq = torch.sigmoid(log_snr)
+        alpha = torch.sqrt(alpha_sq)
+        return RectFlowSchedule(
+            alpha=alpha,
+            sigma=1 - alpha,
             log_snr=log_snr
         )
     
 
 class VariancePreservingScheduler(BaseScheduler):
-    def __init__(self, n_steps):
+    def __init__(self, n_steps, pred_type='noise'):
         self.n_steps = n_steps
+
+        assert pred_type in ['noise', 'velocity']
+        self.pred_type = pred_type
 
     def get_schedule(self, t: torch.LongTensor) -> VPSchedule:
         raise NotImplementedError()
         
-    def get_loss(self, x: torch.Tensor, model, gen=None, **model_call_kwargs):
-        # noise prediction
+    def get_loss(
+            self, 
+            x: torch.Tensor, 
+            model, 
+            gen=None, 
+            **model_call_kwargs
+    ):
         eps = torch.randn_like(x, generator=gen)
         t = torch.randint(
             0, self.n_steps, size=(x.size(0),), 
             device=x.device,
             generator=gen
         )
+        schedule = self.get_schedule(t)
 
-        x_t = self.diffuse(x, t, eps)
-        eps_pred = model(x_t, t, **model_call_kwargs)
+        shape = (-1,) + (1,) * (len(x.shape) - 1)
+        alpha = schedule.alpha.to(dtype=x.dtype, device=x.device).view(*shape)
+        sigma = schedule.sigma.to(dtype=x.dtype, device=x.device).view(*shape)
 
-        loss = F.mse_loss(eps_pred, eps)
+        x_t = alpha * x + sigma * eps
+        pred = model(x_t, t, **model_call_kwargs)
+
+        if self.pred_type == 'noise':
+            target = eps
+        elif self.pred_type == 'velocity':
+            target = alpha * eps - sigma * x
+        else:
+            raise ValueError(f'unknown pred type {self.pred_type}')
+
+        loss = F.mse_loss(pred, target)
         return loss
 
     def diffuse(self, x, t, eps):
         schedule = self.get_schedule(t)
 
         shape = (-1,) + (1,) * (len(x.shape) - 1)
-        alpha_ = torch.sqrt(schedule.alpha_sq).to(dtype=x.dtype, device=x.device).view(*shape)
-        sigma_ = torch.sqrt(schedule.sigma_sq).to(dtype=x.dtype, device=x.device).view(*shape)
+        alpha_ = schedule.alpha.to(dtype=x.dtype, device=x.device).view(*shape)
+        sigma_ = schedule.sigma.to(dtype=x.dtype, device=x.device).view(*shape)
 
         x_t = alpha_ * x + sigma_ * eps
         return x_t
@@ -90,28 +133,58 @@ class BetaScheduler(VariancePreservingScheduler):
             beta_start=1e-4,
             beta_end=2e-2,
             cos_s=0.008,
-            cos_max_beta=0.999,
+            max_beta=0.999,
             n_steps=1000,
+            pred_type='noise',
     ):
+        super().__init__(n_steps=n_steps, pred_type=pred_type)
+
         if schedule == 'linear':
             beta = torch.linspace(beta_start, beta_end, steps=n_steps, dtype=torch.float64)
         elif schedule == 'cosine':
-            beta = self.alpha_cosine(cos_s, cos_max_beta, n_steps)
+            beta = BetaScheduler.get_betas_for_alpha(
+                'cosine', 
+                cos_s=cos_s, 
+                max_beta=max_beta, 
+                n_steps=n_steps
+            )
+        elif schedule == 'square':
+            beta = torch.linspace(
+                beta_start ** 0.5, beta_end ** 0.5,
+                steps=n_steps, dtype=torch.float64
+            ) ** 2
+        elif schedule == 'laplace':
+            beta = BetaScheduler.get_betas_for_alpha(
+                'laplace', 
+                max_beta=max_beta, 
+                n_steps=n_steps
+            )
+        elif schedule == 'sigmoid':
+            sig_x = torch.linspace(-6, 6, n_steps)
+            beta = torch.sigmoid(sig_x) * (beta_end - beta_start) + beta_start
         else:
             raise ValueError(f'unknown schedule type {schedule}')
+        self.schedule = schedule
 
-        self.n_steps = n_steps
         self.beta = beta
         self.alpha_sq = torch.cumprod(1 - beta, dim=0)
 
     def get_schedule(self, t: torch.LongTensor) -> VPSchedule:
-        alpha_sq = self.alpha_sq.to(t.device)[t]
-        return VPSchedule.from_alpha_sq(alpha_sq)
+        alpha = torch.sqrt(self.alpha_sq.to(t.device)[t])
+        return VPSchedule.from_alpha(alpha)
 
     @staticmethod
-    def alpha_cosine(s=0.008, max_beta=0.999, n_steps=1000):
-        def alpha_bar_fn(t):
-            return math.cos((t + s) / (1 + s) * math.pi / 2) ** 2
+    def get_betas_for_alpha(alpha_type, cos_s=0.008, max_beta=0.999, n_steps=1000):
+        if alpha_type == 'cosine':
+            def alpha_bar_fn(t):
+                return math.cos((t + cos_s) / (1 + cos_s) * math.pi / 2) ** 2
+        elif alpha_type == 'laplace':
+            def alpha_bar_fn(t):
+                lmb = -0.5 * math.copysign(1, 0.5 - t) * math.log(1 - 2 * math.fabs(0.5 - t) + 1e-6)
+                snr = math.exp(lmb)
+                return math.sqrt(snr / (1 + snr))
+        else:
+            raise ValueError(f'unknown alpha type {alpha_type}')
 
         beta = []
         for i in range(n_steps):
@@ -121,8 +194,56 @@ class BetaScheduler(VariancePreservingScheduler):
         return beta
 
 
+class LogSNRScheduler:
+    def __init__(
+            self,
+            distribution='gaussian',
+            mean=0.0,
+            std=1.0,
+            low=-20.0,
+            high=20.0,
+            cos_s=0.008,
+            cos_shift=0.0,
+            cos_eps=1e-7,
+    ):
+        if distribution == 'gaussian':
+            self.distribution = distribution
+            self.dist_kwargs = {'mean': mean, 'std': std}
+        elif distribution == 'uniform':
+            self.distribution = distribution
+            self.dist_kwargs = {'low': low, 'high': high}
+        elif distribution == 'cosine':
+            self.distribution = 'cosine'
+            self.dist_kwargs = {'s': cos_s, 'shift': cos_shift, 'eps': cos_eps}
+        else:
+            raise ValueError(f'unknown distribution type {distribution}')
+    
+    def sample_log_snr(self, shape, device, gen=None):
+        pass
+
+    def get_loss(self, x: torch.Tensor, model, gen=None, **model_call_kwargs):
+        raise NotImplementedError()
+
+    def diffuse(self, x: torch.Tensor, eps: torch.Tensor, t: torch.Tensor):
+        raise NotImplementedError()
+
+    @staticmethod
+    def sample_gaussian(mean, std, shape, device, gen=None):
+        return torch.randn(shape, device=device, generator=gen) * std + mean
+    
+    @staticmethod
+    def sample_uniform(low, high, shape, device, gen=None):
+        return torch.rand(shape, device=device, generator=gen) * (high - low) + low
+    
+    @staticmethod
+    def sample_cosine(s, shift, eps, shape, device, gen=None):
+        t = torch.rand(shape, device=device, generator=gen)
+        alpha_sq = torch.cos((t + s) / (1 + s) * math.pi / 2) ** 2
+        alpha_sq = torch.clip(alpha_sq, eps, 1 - eps)
+        
+        
 class RectifiedFlowScheduler(BaseScheduler):
-    pred_type = 'velocity'
+    pred_type = 'rect_flow'
 
     def __init__(
             self,
@@ -151,6 +272,50 @@ class RectifiedFlowScheduler(BaseScheduler):
         sigma_ = self.sigmas.to(dtype=x.dtype, device=x.device)[t].view(*shape)
         x_t = (1 - sigma_) * x + sigma_ * eps
         return x_t
+        
+    
+class JITScheduler(BaseScheduler):
+    pred_type = 'data'
+
+    # x_0: noise
+    # x_1: data
+
+    def __init__(
+            self,
+            eps=0.05
+    ):
+        self.eps = eps
+    
+    def x_to_v(self, x, x_t, t):
+        v = (x - x_t) / (1 - t).clamp_min(self.eps)
+        return v
+    
+    def guided_v(self, x_cond, x_uncond, x_t, t, guidance_scale):
+        v_cond = self.x_to_v(x_cond, x_t, t)
+        v_uncond = self.x_to_v(x_uncond, x_t, t)
+        v_guided = v_uncond + guidance_scale * (v_cond - v_uncond)
+        return v_guided
+
+    def get_loss(self, x, model, gen=None, **model_call_kwargs):
+        # x prediction
+        eps = torch.randn_like(x, generator=gen)
+        t = torch.rand(x.size(0), device=x.device, generator=gen)
+
+        x_t = self.diffuse(x, t, eps)
+        v = self.x_to_v(x, x_t, t)
+
+        x_pred = model(x_t, t, **model_call_kwargs)
+        v_pred = self.x_to_v(x_pred, x_t, t)
+
+        loss = F.mse_loss(v_pred, v)
+        return loss
+        
+    def diffuse(self, x, t, eps):
+        shape = (-1,) + (1,) * (x.ndim - 1)
+        t = t.view(*shape)
+        x_t = t * x + (1 - t) * eps
+        return x_t
+
 
 
 

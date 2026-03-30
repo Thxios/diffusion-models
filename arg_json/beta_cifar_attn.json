@@ -1,15 +1,14 @@
 {
-  "output_dir": "outputs/rf_cifar10_long2",
-  "wandb_run_name": "rf_cifar10_long2",
-
+  "output_dir": "outputs/beta_cifar10_attn",
+  "wandb_run_name": "beta_cifar10_attn",
   "max_steps": 1000000,
   "logging_steps": 50,
-  "eval_steps": 5000,
-  "save_steps": 25000,
+  "eval_steps": 2000,
+  "save_steps": 20000,
   "eval_n_examples": 40,
   "guidance_scale": 1.0,
 
-  "fid_eval_steps": 25000,
+  "fid_eval_steps": 20000,
   "fid_ema": true,
   "fid_reference_dataset": "cifar10-train",
   "fid_n_examples": 10000,
@@ -19,60 +18,67 @@
   "fid_adjust_subsets": [4000, 6000, 8000, 10000],
 
   "batch_size": 128,
-  "lr": 0.0001,
+  "lr": 0.0002,
+  "lr_scheduler": "linear",
+  "lr_warmup_steps": 5000,
   "optimizer": "adamw",
   "clip_grad_norm": 1.0,
   "use_ema": true,
   "ema_inv_gamma": 1.0,
-  "ema_power": 0.6667,
+  "ema_power": 0.75,
   "dataset": "cifar10",
   "dataset_dir": "~/datasets",
   "augmentations": ["RandomHorizontalFlip"],
   "dataloader_num_workers": 2,
-
-  "device": "cuda:1",
+  "device": "cuda:6",
   "seed": 42,
-  
+  "bf16": true,
+
   "p_uncond": 0.2,
   "model_type": "unet",
   "model_cfg": {
     "in_channels": 3,
     "out_channels": 3,
     "down_block_types": [
-      "UNetDownBlock",
-      "UNetDownBlock",
-      "UNetDownBlock"
+      "UNetAttnDownBlock",
+      "UNetAttnDownBlock",
+      "UNetAttnDownBlock"
     ],
     "up_block_types": [
-      "UNetUpBlock",
-      "UNetUpBlock",
-      "UNetUpBlock"
+      "UNetAttnUpBlock",
+      "UNetAttnUpBlock",
+      "UNetAttnUpBlock"
     ],
     "block_out_channels": [
-      128,
       256,
-      512
+      256,
+      256
     ],
     "n_blocks_per_layer": 2,
     "mid_attention": true,
     "n_dim_attention_head": 8,
     "norm_groups": 32,
     "activation": "silu",
-    "time_encoding_dim": 128,
-    "embedding_dim": 128,
+    "time_encoding_dim": 256,
+    "embedding_dim": 256,
     "embedding_mixing": "scale_shift",
     "n_class_embeddings": 10,
-    "dropout": 0.0,
+    "dropout": 0.13,
     "downsample_use_conv": true,
     "upsample_use_conv": true
   },
-  "scheduler_type": "rectified_flow",
+  "scheduler_type": "beta",
   "scheduler_cfg": {
+    "schedule": "linear",
+    "beta_start": 0.0001,
+    "beta_end": 0.02,
     "n_steps": 1000
   },
-  "sampler_type": "euler",
+  "sampler_type": "ddim",
   "sampler_cfg": {
     "n_steps": 50,
+    "eta": 0.0,
+    "clip_latent": true,
     "pbar": true
   }
 }

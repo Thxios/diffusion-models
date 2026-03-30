@@ -5,7 +5,7 @@ import tqdm.auto as tqdm
 from typing import Callable, Optional
 
 from diffusion.scheduler import VariancePreservingScheduler, BetaScheduler, \
-    RectifiedFlowScheduler
+    RectifiedFlowScheduler, JITScheduler
 
 
 def get_sampler(name, **kwargs):
@@ -42,6 +42,7 @@ class BaseSampler:
             z: torch.Tensor,
             scheduler,
             pred_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+            return_intermediates=False,
             **kwargs
     ):
         raise NotImplementedError()
@@ -54,6 +55,7 @@ class DDPMSampler(BaseSampler):
             z: torch.Tensor,
             scheduler: BetaScheduler,
             pred_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+            return_intermediates=False,
             gen: Optional[torch.Generator] = None
     ):
         t_steps = torch.linspace(
@@ -63,29 +65,34 @@ class DDPMSampler(BaseSampler):
             device=z.device
         )[:-1]
 
-        # align notation with ddpm paper
-        beta = scheduler.beta.to(device=z.device, dtype=z.dtype)
-        coef = beta / torch.sqrt(1 - scheduler.alpha_sq).to(device=z.device, dtype=z.dtype) # (1 - alpha_t) / sqrt(1 - alpha_bar_t)
-        inv_alpha_t_sqrt = 1 / torch.sqrt(1 - beta)
-        sigma_t = torch.sqrt(beta)
+        schedule = scheduler.get_schedule(t_steps)
+        beta = scheduler.beta.to(device=z.device, dtype=z.dtype)[t_steps]
+        coef = beta / schedule.sigma.to(device=z.device, dtype=z.dtype)
+        inv_alpha_sqrt = 1 / torch.sqrt(1 - beta)
+        sigma = torch.sqrt(beta)
 
         iterator = self.prepare_iterator(range(self.n_steps))
+        intermediates = []
         for i in iterator:
-            t = t_steps[i]
-            eps_pred = pred_fn(z, t.repeat(z.size(0)))
-            z = inv_alpha_t_sqrt[t] * (z - coef[t] * eps_pred)
+            eps_pred = pred_fn(z, t_steps[i].repeat(z.size(0)))
+            z = inv_alpha_sqrt[i] * (z - coef[i] * eps_pred)
             
             if i < self.n_steps - 1:
                 noise = torch.randn_like(z, generator=gen)
-                z = z + sigma_t[t] * noise
+                z = z + sigma[i] * noise
+            if return_intermediates:
+                intermediates.append(z.cpu())
 
-        return z
-
+        if return_intermediates:
+            return z, torch.stack(intermediates, dim=0)
+        else:
+            return z
 
 
 class DDIMSampler(BaseSampler):
     def __init__(self, n_steps, eta=0.0, clip_latent=True, pbar=False, pbar_kwargs=None):
         super().__init__(n_steps, pbar, pbar_kwargs)
+        # TODO: implement stochastic sampling when eta > 0
         self.eta = eta
         self.clip_latent = clip_latent
     
@@ -95,8 +102,8 @@ class DDIMSampler(BaseSampler):
             z: torch.Tensor,
             scheduler: VariancePreservingScheduler,
             pred_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+            return_intermediates=False
     ):
-
         t_steps = torch.linspace(
             scheduler.n_steps - 1, 0,
             steps=self.n_steps + 1,
@@ -104,32 +111,89 @@ class DDIMSampler(BaseSampler):
             device=z.device
         )[:-1]
 
+        schedule = scheduler.get_schedule(t_steps)
+        alpha = schedule.alpha.to(device=z.device, dtype=z.dtype)
+        sigma = schedule.sigma.to(device=z.device, dtype=z.dtype)
+
         iterator = self.prepare_iterator(range(self.n_steps))
+        intermediates = []
         for i in iterator:
             eps_pred = pred_fn(z, t_steps[i].repeat(z.size(0)))
-            t = scheduler.get_schedule(t_steps[i])
 
-            alpha_t_ = torch.sqrt(t.alpha_sq).to(z.dtype)
-            sigma_t_ = torch.sqrt(t.sigma_sq).to(z.dtype)
-            x0_pred = (z - sigma_t_ * eps_pred) / alpha_t_
+            x0_pred = (z - sigma[i] * eps_pred) / alpha[i]
             if self.clip_latent:
                 x0_pred = torch.clip(x0_pred, -1, 1)
 
             if i < self.n_steps - 1:
-                t_prime = scheduler.get_schedule(t_steps[i + 1])
-
-                alpha_t_prime_ = torch.sqrt(t_prime.alpha_sq).to(z.dtype)
-                sigma_t_prime_ = torch.sqrt(t_prime.sigma_sq).to(z.dtype)
-                z = alpha_t_prime_ * x0_pred + sigma_t_prime_ * eps_pred
-
+                z = alpha[i + 1] * x0_pred + sigma[i + 1] * eps_pred
             else:
                 z = x0_pred
+            if return_intermediates:
+                intermediates.append(z.cpu())
 
-        return z
+        if return_intermediates:
+            return z, torch.stack(intermediates, dim=0)
+        else:
+            return z
+
     
+class DPMpp2MSolver(BaseSampler):
+    def __init__(self, n_steps, clip_latent=True, pbar=False, pbar_kwargs=None):
+        super().__init__(n_steps, pbar, pbar_kwargs)
+        self.clip_latent = clip_latent
+
+    @torch.no_grad()
+    def sample(
+            self,
+            z: torch.Tensor,
+            scheduler: VariancePreservingScheduler,
+            pred_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+            return_intermediates=False
+    ):
+        t_steps = torch.linspace(
+            scheduler.n_steps - 1, 0,
+            steps=self.n_steps + 1,
+            dtype=torch.int64,
+            device=z.device
+        )  # total N+1 steps (in order to fit NFE to N)
+
+        schedule = scheduler.get_schedule(t_steps)
+        alpha = schedule.alpha.to(device=z.device, dtype=z.dtype)
+        sigma = schedule.sigma.to(device=z.device, dtype=z.dtype)
+        # h[i] is h_{i+1} (due to shifting)
+        h = torch.diff(0.5 * schedule.log_snr).to(device=z.device, dtype=z.dtype)
+
+        iterator = self.prepare_iterator(range(self.n_steps))
+        intermediates = []
+        prev_x0_pred = None
+
+        for i in iterator:
+            eps_pred = pred_fn(z, t_steps[i].repeat(z.size(0)))
+
+            x0_pred = (z - sigma[i] * eps_pred) / alpha[i]
+            if self.clip_latent:
+                x0_pred = torch.clip(x0_pred, -1, 1)
+
+            if i == 0:
+                d = x0_pred
+            else:
+                inv_2r = 0.5 * h[i] / h[i - 1]
+                d = (1 + inv_2r) * x0_pred - inv_2r * prev_x0_pred
+            
+            z = (sigma[i + 1] / sigma[i]) * z - (alpha[i + 1] * torch.expm1(-h[i])) * d
+            prev_x0_pred = x0_pred
+
+            if return_intermediates:
+                intermediates.append(z.cpu())
+
+        if return_intermediates:
+            return z, torch.stack(intermediates, dim=0)
+        else:
+            return z
+
 
 class RectifiedFlowEulerSampler(BaseSampler):
-    pred_type = 'velocity'
+    pred_type = 'rect_flow'
 
     @torch.no_grad()
     def sample(
@@ -137,6 +201,7 @@ class RectifiedFlowEulerSampler(BaseSampler):
             z: torch.Tensor,
             scheduler: RectifiedFlowScheduler,
             pred_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+            return_intermediates=False
     ):
         t_steps = torch.linspace(
             scheduler.n_steps - 1, 0,
@@ -145,7 +210,7 @@ class RectifiedFlowEulerSampler(BaseSampler):
             device=z.device
         )[:-1]
         iterator = self.prepare_iterator(range(self.n_steps))
-
+        intermediates = []
         for i in iterator:
             v_pred = pred_fn(z, t_steps[i].repeat(z.size(0)))
             # optimal: v_pred = x0 - eps
@@ -157,7 +222,43 @@ class RectifiedFlowEulerSampler(BaseSampler):
 
             z = z - dt * v_pred
 
-        return z
+            if return_intermediates:
+                intermediates.append(z.cpu())
+
+        if return_intermediates:
+            return z, torch.stack(intermediates, dim=0)
+        else:
+            return z
+
+
+class JITSampler(BaseSampler):
+    pred_type = 'data'
+
+    @torch.no_grad()
+    def sample(
+            self,
+            z: torch.Tensor,
+            scheduler: JITScheduler,
+            pred_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],  # must be v pred with cfg
+            return_intermediates=False
+    ):
+        t = torch.linspace(0, 1, steps=self.n_steps + 1, device=z.device)
+
+        iterator = self.prepare_iterator(range(self.n_steps))
+        intermediates = []
+        for i in iterator:
+
+            v_pred = pred_fn(z, t[i].repeat(z.size(0)))
+
+            z = z + (t[i + 1] - t[i]) * v_pred
+
+            if return_intermediates:
+                intermediates.append(z.cpu())
+
+        if return_intermediates:
+            return z, torch.stack(intermediates, dim=0)
+        else:
+            return z
 
     
 

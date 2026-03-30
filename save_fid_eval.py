@@ -141,7 +141,7 @@ def main(
 
     ckpt_file = 'ema_model.pt' if use_ema else 'model.pt'
     ckpt_path = os.path.join(ckpt_dir, 'ckpts', ckpt_name, ckpt_file)
-    load_result = model.load_state_dict(torch.load(ckpt_path))
+    load_result = model.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
     print_(load_result)
     model.to(device)
     model.eval()
@@ -280,6 +280,8 @@ def main_all_ckpt(
                     verbose=False,
                     seed=seed,
                 )
+                torch.cuda.empty_cache()
+                gc.collect()
             pbar.update(1)
             output_jsons.append(output_path)
     
@@ -294,7 +296,7 @@ def main_all_ckpt(
     df.to_csv(csv_path, index=False)
     print(f"Saved all FID results to {csv_path}")
 
-# python save_fid_eval.py outputs/cos_cifar10_attn resources/cos_cifar10_attn_fid --sampling_steps 100 --guidance_scale 1.0 --fid_reference_dataset "cifar10-train" --fid_n_examples 50000 --fid_adjust_subsets "[10000,20000,30000,40000,50000]" --seed 42 --device "cuda:4"
+# python save_fid_eval.py outputs/beta_cifar10_attn resources/beta_cifar10_attn_fid --sampling_steps 100 --guidance_scale 1.0 --fid_reference_dataset "cifar10-train" --fid_n_examples 50000 --fid_adjust_subsets "[10000,20000,30000,40000,50000]" --bf16 --seed 42 --device "cuda:0"
 if __name__ == "__main__":
     # fire.Fire(main)
     fire.Fire(main_all_ckpt)
