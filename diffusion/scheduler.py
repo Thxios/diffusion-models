@@ -282,24 +282,31 @@ class JITScheduler(BaseScheduler):
 
     def __init__(
             self,
-            eps=0.05
+            noise_scale=1.0,
+            t_eps=0.05,
+            logit_t_mean=-0.8,
+            logit_t_std=1.0,
     ):
-        self.eps = eps
+        self.noise_scale = noise_scale
+        self.t_eps = t_eps
+        self.logit_t_mean = logit_t_mean
+        self.logit_t_std = logit_t_std
     
     def x_to_v(self, x, x_t, t):
-        v = (x - x_t) / (1 - t).clamp_min(self.eps)
+        t = t.view(-1, *((1,) * (x.ndim - 1)))
+        v = (x - x_t) / (1 - t).clamp_min(self.t_eps)
         return v
-    
-    def guided_v(self, x_cond, x_uncond, x_t, t, guidance_scale):
-        v_cond = self.x_to_v(x_cond, x_t, t)
-        v_uncond = self.x_to_v(x_uncond, x_t, t)
-        v_guided = v_uncond + guidance_scale * (v_cond - v_uncond)
-        return v_guided
 
     def get_loss(self, x, model, gen=None, **model_call_kwargs):
         # x prediction
-        eps = torch.randn_like(x, generator=gen)
-        t = torch.rand(x.size(0), device=x.device, generator=gen)
+        eps = torch.randn_like(x, generator=gen) * self.noise_scale
+        
+        t_logit = torch.randn(
+            x.size(0), 
+            device=x.device, dtype=torch.float32, 
+            generator=gen
+        ) * self.logit_t_std + self.logit_t_mean
+        t = torch.sigmoid(t_logit)
 
         x_t = self.diffuse(x, t, eps)
         v = self.x_to_v(x, x_t, t)

@@ -6,6 +6,8 @@ import math
 from functools import partial
 from typing import Optional
 
+from modeling.predictor import GuidedPredictor
+
 
 
 class Dynamic2DRoPE(nn.Module):
@@ -15,8 +17,8 @@ class Dynamic2DRoPE(nn.Module):
         super().__init__()
         assert head_dim % 4 == 0, "head_dim must be divisible by 4 for 2D RoPE"
         half_dim = head_dim // 2
-        freqs = 1.0 / (theta ** (torch.arange(0, half_dim, 2).float() / half_dim))
-        t = torch.arange(max_res).float()
+        freqs = 1.0 / (theta ** (torch.arange(0, half_dim, 2, dtype=torch.float32) / half_dim))
+        t = torch.arange(max_res, dtype=torch.float32)
         freqs = torch.outer(t, freqs)
         
         self.register_buffer("freqs_cos", torch.cos(freqs), persistent=False)
@@ -47,34 +49,36 @@ def apply_rotary_emb(x, cos, sin):
 
 
 class PeriodicEncoding(nn.Module):
-    def __init__(self, hidden_size, time_encoding_dim=256, max_period=10000):
+    def __init__(
+            self, 
+            time_encoding_dim=256, 
+            max_period=10000, 
+            time_scaling=10000
+    ):
         super().__init__()
         assert time_encoding_dim % 2 == 0, "time_encoding_dim must be even for sinusoidal embedding"
+        self.time_scaling = time_scaling
 
-        self.mlp = nn.Sequential(
-            nn.Linear(time_encoding_dim, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
-        )
         self.time_encoding_dim = time_encoding_dim
 
         half_dim = time_encoding_dim // 2
         freq_base = torch.arange(half_dim, dtype=torch.float32) / half_dim
         freq = torch.exp(-math.log(max_period) * freq_base)
-        
+
         self.register_buffer('freq', freq, persistent=False)
 
-    def forward(self, x: torch.Tensor):
-        x_f32 = x.to(torch.float32)
-        freq = x_f32[:, None] * self.freq[None, :]
+    def forward(self, t: torch.Tensor):
+        t = t * self.time_scaling  # scale t \in [0, 1] to [0, time_scaling]
+        t_f32 = t.to(torch.float32)
+        freq = t_f32[:, None] * self.freq[None, :]
         emb = torch.cat([torch.sin(freq), torch.cos(freq)], dim=-1)
         return emb
 
 
 class TimestepEmbedder(nn.Sequential):
-    def __init__(self, time_encoding_dim, embedding_dim, max_period=10000):
+    def __init__(self, time_encoding_dim, embedding_dim, max_period=10000, time_scaling=10000):
         super().__init__(
-            PeriodicEncoding(embedding_dim, time_encoding_dim, max_period),
+            PeriodicEncoding(time_encoding_dim, max_period, time_scaling),
             nn.Linear(time_encoding_dim, embedding_dim),
             nn.SiLU(),
             nn.Linear(embedding_dim, embedding_dim),
@@ -206,7 +210,7 @@ class TransformerBlock(nn.Module):
             hidden_size, 
             intermediate_size, 
             embedding_size, 
-            num_heads: Optional[int] = None,
+            num_heads,
             ffn_bias=True,
             attn_bias=True,
             dropout=0.0,
@@ -225,7 +229,7 @@ class TransformerBlock(nn.Module):
         return x
     
 
-class OutputLayer(nn.Module):
+class OutputHead(nn.Module):
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
         self.norm = nn.RMSNorm(hidden_size)
@@ -242,14 +246,14 @@ class OutputLayer(nn.Module):
         return x
 
 
-class UltimateTransformer(nn.Module):
+class JITTransformer(nn.Module, GuidedPredictor):
     def __init__(
             self,
             in_channels,
             out_channels,
             num_layers,
             hidden_size,
-            embedding_dim,
+            embedding_size,
             patch_size,
             bottleneck_size,
             intermediate_size,
@@ -257,6 +261,7 @@ class UltimateTransformer(nn.Module):
             num_class_embeddings: Optional[int] = None,
             time_encoding_dim=256,
             max_period=10000,
+            time_scaling=10000,
             ffn_bias=True,
             attn_bias=True,
             dropout=0.0,
@@ -265,33 +270,42 @@ class UltimateTransformer(nn.Module):
         self.patch_size = patch_size
 
         self.patchify = BottleneckPatchEmbedder(
-            patch_size, in_channels, hidden_size, bottleneck_size=bottleneck_size
+            patch_size, 
+            in_channels, 
+            hidden_size, 
+            bottleneck_size
         )
-        self.time_embedding = TimestepEmbedder(time_encoding_dim, embedding_dim, max_period)
+        self.time_embedding = TimestepEmbedder(
+            time_encoding_dim, 
+            embedding_size, 
+            max_period=max_period,
+            time_scaling=time_scaling
+        )
         if num_class_embeddings is not None:
             self.class_embedding = nn.Embedding(
                 num_class_embeddings + 1,
-                embedding_dim,
+                embedding_size,
                 padding_idx=num_class_embeddings,
             )
-            self.register_buffer('uncond_class', torch.tensor(num_class_embeddings))
+            self.register_buffer('uncond_class', torch.tensor(num_class_embeddings), persistent=False)
         else:
             self.class_embedding = None
 
-        self.rope_2d = Dynamic2DRoPE(hidden_size // num_heads, max_res=1024)
+        head_dim = hidden_size // num_heads
+        self.rope_2d = Dynamic2DRoPE(head_dim, max_res=1024)
 
         self.layers = nn.ModuleList([
             TransformerBlock(
                 hidden_size, 
                 intermediate_size, 
-                embedding_dim, 
+                embedding_size, 
                 num_heads, 
-                ffn_bias, 
-                attn_bias, 
-                dropout
+                ffn_bias=ffn_bias, 
+                attn_bias=attn_bias, 
+                dropout=dropout
             ) for _ in range(num_layers)
         ])
-        self.out = OutputLayer(hidden_size, patch_size, out_channels)
+        self.out = OutputHead(hidden_size, patch_size, out_channels)
 
     def forward(
             self,
@@ -327,15 +341,18 @@ class UltimateTransformer(nn.Module):
         x = x.view(batch_size, -1, height, width)
 
         return x
+    
+    def pred_conditional(self, z, t, cond=None, uncond_mask=None):
+        return self.forward(z, t, cls=cond, uncond_mask=uncond_mask)
 
 
 if __name__ == '__main__':
-    model = UltimateTransformer(
+    model = JITTransformer(
         in_channels=3,
         out_channels=3,
         num_layers=4,
         hidden_size=256,
-        embedding_dim=256,
+        embedding_size=256,
         patch_size=16,
         bottleneck_size=32,
         intermediate_size=768,

@@ -209,14 +209,15 @@ class RectifiedFlowEulerSampler(BaseSampler):
             dtype=torch.int64,
             device=z.device
         )[:-1]
+        sigmas = scheduler.sigmas.to(device=z.device, dtype=z.dtype)
         iterator = self.prepare_iterator(range(self.n_steps))
         intermediates = []
         for i in iterator:
             v_pred = pred_fn(z, t_steps[i].repeat(z.size(0)))
             # optimal: v_pred = x0 - eps
 
-            sigma_t = scheduler.sigmas[t_steps[i]]
-            sigma_next = scheduler.sigmas[t_steps[i + 1]] if i < self.n_steps - 1 else 0
+            sigma_t = sigmas[t_steps[i]]
+            sigma_next = sigmas[t_steps[i + 1]] if i < self.n_steps - 1 else sigmas.new_zeros(1)
             dt = sigma_next - sigma_t
             # dt < 0 since sigmas are increasing, so we are doing Euler *backward* steps
 
@@ -231,15 +232,58 @@ class RectifiedFlowEulerSampler(BaseSampler):
             return z
 
 
+from modeling.predictor import GuidedPredictor
+
 class JITSampler(BaseSampler):
     pred_type = 'data'
+    def __init__(
+            self, 
+            n_steps, 
+            scheduler: JITScheduler, 
+            ode_solver='euler',
+            guidance_scale=1.0,
+            cfg_interval: Optional[tuple[float, float]] = None,
+            pbar=False, 
+            pbar_kwargs=None
+    ):
+        super().__init__(n_steps, pbar, pbar_kwargs)
+        self.scheduler: JITScheduler = scheduler
+
+        self.ode_solver = ode_solver
+        self.guidance_scale = guidance_scale
+        self.cfg_interval = cfg_interval
+
+    @torch.no_grad()
+    def pred_v_guided(
+            self, 
+            model: GuidedPredictor, 
+            z, t, cond=None, 
+    ):
+        x_cond = model.pred_conditional(z, t, cond=cond)
+        v_cond = self.scheduler.x_to_v(x_cond, z, t)
+        if self.guidance_scale == 1.0 or cond is None:
+            return v_cond
+        
+        x_uncond = model.pred_conditional(z, t)
+        v_uncond = self.scheduler.x_to_v(x_uncond, z, t)
+
+        if self.cfg_interval is None:
+            cfg = self.guidance_scale
+        else:
+            low, high = self.cfg_interval
+            interval_mask = (t < high) & ((low == 0) | (t > low))
+            cfg = torch.where(interval_mask, self.guidance_scale, 1.0)
+            cfg = cfg.view(-1, *([1] * (z.ndim - 1)))
+
+        v_guided = v_uncond + cfg * (v_cond - v_uncond)
+        return v_guided
 
     @torch.no_grad()
     def sample(
             self,
             z: torch.Tensor,
-            scheduler: JITScheduler,
-            pred_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],  # must be v pred with cfg
+            model: GuidedPredictor,
+            cond: Optional[torch.Tensor] = None,
             return_intermediates=False
     ):
         t = torch.linspace(0, 1, steps=self.n_steps + 1, device=z.device)
@@ -247,10 +291,14 @@ class JITSampler(BaseSampler):
         iterator = self.prepare_iterator(range(self.n_steps))
         intermediates = []
         for i in iterator:
+            v_pred = self.pred_v_guided(model, z, t[i].repeat(z.size(0)), cond=cond)
 
-            v_pred = pred_fn(z, t[i].repeat(z.size(0)))
-
-            z = z + (t[i + 1] - t[i]) * v_pred
+            if self.ode_solver == 'euler':
+                z = z + (t[i + 1] - t[i]) * v_pred
+            elif self.ode_solver == 'heun':
+                z_euler = z + (t[i + 1] - t[i]) * v_pred
+                v_pred_next = self.pred_v_guided(model, z_euler, t[i + 1].repeat(z.size(0)), cond=cond)
+                z = z + (t[i + 1] - t[i]) * 0.5 * (v_pred + v_pred_next)
 
             if return_intermediates:
                 intermediates.append(z.cpu())

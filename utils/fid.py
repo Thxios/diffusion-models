@@ -3,11 +3,14 @@ import os
 # os.environ["OMP_NUM_THREADS"] = "1"
 import numpy as np
 import torch
+from functools import partial
 from pytorch_fid.inception import InceptionV3
-from torchvision.datasets import CIFAR10, MNIST
-from torch.utils.data import DataLoader, TensorDataset
+from torchvision.datasets import CIFAR10, MNIST, LSUN
+import torchvision.transforms as T
+from torch.utils.data import DataLoader, TensorDataset, Dataset
 import tqdm.auto as tqdm
-from typing import Union
+from typing import Union, Optional
+from datasets import load_dataset
 
 from threadpoolctl import threadpool_limits
 from pytorch_fid.fid_score import calculate_frechet_distance as _calculate_frechet_distance
@@ -25,6 +28,10 @@ REFERENCE_FILES = {
     'cifar10-test': 'cifar10-test-inception.npz',
     'mnist-train': 'mnist-train-inception.npz',
     'mnist-test': 'mnist-test-inception.npz',
+    'lsun-church_outdoor-train': 'lsun-church_outdoor-train-inception.npz',
+    'lsun-church_outdoor-test': 'lsun-church_outdoor-test-inception.npz',
+    'imagenet-1k-256-train': 'imagenet-1k-256-train-inception.npz',
+    'imagenet-1k-256-test': 'imagenet-1k-256-test-inception.npz',
 }
 
 
@@ -43,17 +50,25 @@ def load_hidden_parameters(dataset, save=True, **kwargs):
 
 @torch.no_grad()
 def calc_inception_features(
-        images: torch.Tensor,  # (N, C, H, W), in range [-1, 1]
+        images: Optional[torch.Tensor] = None,  # (N, C, H, W), in range [-1, 1]
+        dataset: Optional[Dataset] = None,
         batch_size=256,
         device='cpu',
+        num_workers=2,
         pbar=True,
         pbar_kwargs=None,
+        batch_image_key=0,
 ):
+    assert images is not None or dataset is not None, 'either images or dataset must be provided'
+    if images is not None:
+        dataset = TensorDataset(images)
+
     model = InceptionV3([InceptionV3.BLOCK_INDEX_BY_DIM[2048]], normalize_input=False)
 
     loader = DataLoader(
-        TensorDataset(images),
+        dataset,
         batch_size=batch_size,
+        num_workers=num_workers,
         shuffle=False,
         drop_last=False
     )
@@ -67,9 +82,9 @@ def calc_inception_features(
     iterator = tqdm.tqdm(loader, **pb_kwargs) if pbar else loader
 
     hiddens = []
-    for x, *_ in iterator:
-        x = x.to(device)
-        out = model(x)[0].squeeze().cpu()
+    for batch in iterator:
+        x = batch[batch_image_key].to(device)
+        out = model(x)[0].flatten(1).cpu()
         hiddens.append(out)
 
     hiddens = torch.cat(hiddens, dim=0)
@@ -85,24 +100,9 @@ def inception_features_to_hidden_parameters(features: Union[torch.Tensor, np.nda
     return mu, sigma
 
 
-def calc_hidden_parameters(
-        images: torch.Tensor,  # (N, C, H, W), in range [-1, 1]
-        batch_size=256,
-        device='cpu',
-        pbar=True,
-        pbar_kwargs=None,
-):
-    features = calc_inception_features(
-        images,
-        batch_size=batch_size,
-        device=device,
-        pbar=pbar,
-        pbar_kwargs=pbar_kwargs,
-    )
-    mu, sigma = inception_features_to_hidden_parameters(features)
-    return mu, sigma
-
-
+def apply_transform(examples, transform):
+    images = [transform(image) for image in examples['image']]
+    return {'image': images}
 
 def save_hidden_parameters(dataset, **kwargs):
     if dataset.endswith('train'):
@@ -113,19 +113,45 @@ def save_hidden_parameters(dataset, **kwargs):
         raise ValueError(f'unsupported dataset: {dataset}')
     
     if dataset.startswith('cifar10'):
-        data = CIFAR10(DATASETS_DIR, train=train, download=True).data
-        data = torch.from_numpy(data).to(torch.float32).permute(0, 3, 1, 2)
-        data = data / 127.5 - 1  # scale to [-1, 1]
-        print(type(data), data.shape, data.dtype, data.min(), data.max())
+        transform = T.Compose([T.ToTensor(), T.Normalize(0.5, 0.5)])
+        ds = CIFAR10(DATASETS_DIR, train=train, download=True, transform=transform)
+        print(ds[0][0].shape, ds[0][0].dtype, ds[0][0].min(), ds[0][0].max())
     elif dataset.startswith('mnist'):
-        data = MNIST(DATASETS_DIR, train=train, download=True).data
-        data = data.unsqueeze(1).repeat(1, 3, 1, 1).to(torch.float32)  # (N, 1, H, W) -> (N, 3, H, W)
-        data = data / 127.5 - 1  # scale to [-1, 1]
-        print(type(data), data.shape, data.dtype, data.min(), data.max())
+        transform = T.Compose([
+            T.Grayscale(num_output_channels=3),
+            T.ToTensor(), T.Normalize(0.5, 0.5)]
+        )
+        ds = MNIST(DATASETS_DIR, train=train, download=True, transform=transform)
+        print(ds[0][0].shape, ds[0][0].dtype, ds[0][0].min(), ds[0][0].max())
+    elif dataset.startswith('lsun-church_outdoor'):
+        transform = T.Compose([
+            T.Resize(256),
+            T.CenterCrop(256),
+            T.ToTensor(),
+            T.Normalize(0.5, 0.5)
+        ])
+        ds = LSUN(
+            os.path.join(DATASETS_DIR, 'lsun'),
+            classes=['church_outdoor_' + ('train' if train else 'val')], 
+            transform=transform
+        )
+        print(ds[0][0].shape, ds[0][0].dtype, ds[0][0].min(), ds[0][0].max())
+    elif dataset.startswith('imagenet-1k-256'):
+        imagenet_id = 'benjamin-paine/imagenet-1k-256x256'
+        transform = T.Compose([
+            T.ToTensor(),
+            T.Normalize(mean=0.5, std=0.5),
+        ])
+        transform_fn = partial(apply_transform, transform=transform)
+        ds = load_dataset(imagenet_id, split='train' if train else 'validation')
+        ds.set_transform(transform_fn)
+        print(ds[0]['image'].shape, ds[0]['image'].dtype, ds[0]['image'].min(), ds[0]['image'].max())
+        kwargs['batch_image_key'] = 'image'
     else:
         raise ValueError(f'unsupported dataset: {dataset}')
 
-    mu, sigma = calc_hidden_parameters(data, **kwargs)
+    hiddens = calc_inception_features(dataset=ds, **kwargs)
+    mu, sigma = inception_features_to_hidden_parameters(hiddens)
     print(mu.shape, mu.dtype)
     print(sigma.shape, sigma.dtype)
     save_path = os.path.join(REFERENCE_FILES_DIR, REFERENCE_FILES[dataset])
@@ -135,14 +161,14 @@ def save_hidden_parameters(dataset, **kwargs):
 
 
 def main():
-    batch_size = 256
-    device = 'cuda:5'
+    batch_size = 1024
+    device = 'cuda:0'
     for dataset in REFERENCE_FILES.keys():
         if os.path.exists(os.path.join(REFERENCE_FILES_DIR, REFERENCE_FILES[dataset])):
             print(f'{dataset} hidden parameters already exist. skipping...')
             continue
         print(f'calculating and saving hidden parameters of {dataset}...')
-        save_hidden_parameters(dataset, batch_size=batch_size, device=device)
+        save_hidden_parameters(dataset, batch_size=batch_size, device=device, num_workers=2)
 
 
 if __name__ == '__main__':
