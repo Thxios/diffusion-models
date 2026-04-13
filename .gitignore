@@ -5,6 +5,7 @@ stdouts
 test_notebooks
 
 **/_cache_*
+_cache_*
 
 .vscode
 
