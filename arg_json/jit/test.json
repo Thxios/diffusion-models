@@ -1,0 +1,78 @@
+{
+  "output_dir": "outputs/jit/test",
+  "wandb_run_name": null,
+  "wandb_run_id": null,
+  "max_steps": 100000,
+  "logging_steps": 10,
+  "eval_steps": 10,
+  "save_steps": 100,
+  "eval_n_examples": 40,
+  "fid_eval_steps": 10,
+  "fid_reference_dataset": "lsun-church_outdoor-train",
+  "fid_n_examples": 5000,
+  "generation_batch_size": 512,
+  "inception_batch_size": 512,
+  "adjust_fid_n": false,
+  "fid_adjust_subsets": [
+    4000,
+    6000,
+    8000,
+    10000
+  ],
+  "batch_size": 256,
+  "lr": 0.0002,
+  "lr_scheduler": "constant_with_warmup",
+  "lr_warmup_steps": 1000,
+  "lr_schduler_cfg": {},
+  "optimizer": "adamw",
+  "adam_betas": [
+    0.9,
+    0.99
+  ],
+  "clip_grad_norm": 1.0,
+  "ema_inv_gamma": 1.0,
+  "ema_power": 0.75,
+  "dataset": "lsun-church_outdoor",
+  "dataset_dir": "/home/jimyeong/datasets/lsun",
+  "augmentations": [
+    "RandomHorizontalFlip"
+  ],
+  "dataloader_num_workers": 4,
+  "dataloader_drop_last": true,
+  "dataloader_pin_memory": true,
+  "device": "cuda:5",
+  "seed": 42,
+  "compile": false,
+  "class_conditioning": false,
+  "p_uncond": 0.1,
+  "model_type": "jit",
+  "model_cfg": {
+    "in_channels": 3,
+    "out_channels": 3,
+    "num_layers": 10,
+    "hidden_size": 512,
+    "embedding_size": 512,
+    "patch_size": 16,
+    "bottleneck_size": 64,
+    "intermediate_size": 1280,
+    "num_heads": 16,
+    "num_class_embeddings": null,
+    "time_encoding_dim": 128,
+    "time_scaling": 10000,
+    "ffn_bias": true,
+    "attn_bias": true,
+    "dropout": 0.0
+  },
+  "scheduler_type": "jit",
+  "scheduler_cfg": {
+    "noise_scale": 1.0,
+    "t_eps": 0.05,
+    "logit_t_mean": -0.8,
+    "logit_t_std": 1.0
+  },
+  "sampler_type": "jit",
+  "sampler_cfg": {
+    "n_steps": 50,
+    "ode_solver": "euler"
+  }
+}

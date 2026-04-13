@@ -1,0 +1,80 @@
+{
+  "output_dir": "outputs/jit/imgnet_abl3",
+  "wandb_run_name": "jit-imagenet-abl3",
+  "max_steps": 500000,
+  "logging_steps": 50,
+  "eval_steps": 5000,
+  "save_steps": 25000,
+  "eval_n_examples": 40,
+  "fid_eval_steps": 25000,
+  "fid_reference_dataset": "imagenet-1k-256-train",
+  "fid_n_examples": 10000,
+  "fid_sample_labels": false,
+  "generation_batch_size": 512,
+  "inception_batch_size": 512,
+  "adjust_fid_n": true,
+  "fid_adjust_subsets": [
+    4000,
+    6000,
+    8000,
+    10000
+  ],
+  "batch_size": 256,
+  "lr": 0.0002,
+  "lr_scheduler": "constant_with_warmup",
+  "lr_warmup_steps": 5000,
+  "lr_schduler_cfg": {},
+  "optimizer": "adamw",
+  "adam_betas": [
+    0.9,
+    0.99
+  ],
+  "clip_grad_norm": 1.0,
+  "ema_inv_gamma": 1.0,
+  "ema_power": 0.75,
+  "dataset": "imagenet-1k-256",
+  "dataset_dir": null,
+  "augmentations": [
+    "RandomHorizontalFlip"
+  ],
+  "dataloader_num_workers": 4,
+  "dataloader_drop_last": true,
+  "dataloader_pin_memory": true,
+  "device": "cuda:5",
+  "seed": 42,
+  "compile": true,
+  "class_conditioning": true,
+  "p_uncond": 0.1,
+  "model_type": "jit",
+  "model_cfg": {
+    "in_channels": 3,
+    "out_channels": 3,
+    "num_layers": 12,
+    "hidden_size": 768,
+    "embedding_size": 768,
+    "patch_size": 16,
+    "bottleneck_size": 128,
+    "intermediate_size": 2048,
+    "num_heads": 12,
+    "num_class_embeddings": 1000,
+    "time_encoding_dim": 256,
+    "time_scaling": 1,
+    "ffn_bias": true,
+    "attn_bias": true,
+    "dropout": 0.0
+  },
+  "scheduler_type": "jit",
+  "scheduler_cfg": {
+    "noise_scale": 1.0,
+    "t_eps": 0.05,
+    "logit_t_mean": -0.8,
+    "logit_t_std": 0.8
+  },
+  "sampler_type": "jit",
+  "sampler_cfg": {
+    "n_steps": 50,
+    "ode_solver": "euler",
+    "guidance_scale": 2.5,
+    "cfg_interval": [0.1, 1.0]
+  }
+}
