@@ -10,7 +10,6 @@ import torchvision.transforms as T
 from torch.utils.data import DataLoader, TensorDataset, Dataset
 import tqdm.auto as tqdm
 from typing import Union, Optional
-from datasets import load_dataset
 
 from threadpoolctl import threadpool_limits
 from pytorch_fid.fid_score import calculate_frechet_distance as _calculate_frechet_distance
@@ -137,6 +136,7 @@ def save_hidden_parameters(dataset, **kwargs):
         )
         print(ds[0][0].shape, ds[0][0].dtype, ds[0][0].min(), ds[0][0].max())
     elif dataset.startswith('imagenet-1k-256'):
+        from datasets import load_dataset
         imagenet_id = 'benjamin-paine/imagenet-1k-256x256'
         transform = T.Compose([
             T.ToTensor(),
