@@ -11,6 +11,8 @@ def get_scheduler(name, **kwargs):
         return BetaScheduler(**kwargs)
     elif name == 'rectified_flow':
         return RectifiedFlowScheduler(**kwargs)
+    elif name == 'jit':
+        return JITScheduler(**kwargs)
     else:
         raise ValueError(f'unknown scheduler type {name}')
 
@@ -103,7 +105,7 @@ class VariancePreservingScheduler(BaseScheduler):
         sigma = schedule.sigma.to(dtype=x.dtype, device=x.device).view(*shape)
 
         x_t = alpha * x + sigma * eps
-        pred = model(x_t, t, **model_call_kwargs)
+        pred = model.pred_conditional(x_t, t, **model_call_kwargs)
 
         if self.pred_type == 'noise':
             target = eps
@@ -262,7 +264,7 @@ class RectifiedFlowScheduler(BaseScheduler):
         )
 
         x_t = self.diffuse(x, t, eps)
-        v_pred = model(x_t, t, **model_call_kwargs)
+        v_pred = model.pred_conditional(x_t, t, **model_call_kwargs)
 
         loss = F.mse_loss(v_pred, x - eps)
         return loss
@@ -300,10 +302,10 @@ class JITScheduler(BaseScheduler):
     def get_loss(self, x, model, gen=None, **model_call_kwargs):
         # x prediction
         eps = torch.randn_like(x, generator=gen) * self.noise_scale
-        
+
         t_logit = torch.randn(
-            x.size(0), 
-            device=x.device, dtype=torch.float32, 
+            x.size(0),
+            device=x.device, dtype=torch.float32,
             generator=gen
         ) * self.logit_t_std + self.logit_t_mean
         t = torch.sigmoid(t_logit)
@@ -311,7 +313,8 @@ class JITScheduler(BaseScheduler):
         x_t = self.diffuse(x, t, eps)
         v = self.x_to_v(x, x_t, t)
 
-        x_pred = model(x_t, t, **model_call_kwargs)
+        # model_call_kwargs carries cond= and uncond_mask= from the unified trainer
+        x_pred = model.pred_conditional(x_t, t, **model_call_kwargs)
         v_pred = self.x_to_v(x_pred, x_t, t)
 
         loss = F.mse_loss(v_pred, v)
