@@ -1,90 +1,127 @@
+"""Unified training entry point — single- and multi-GPU via HF Accelerate.
+
+Usage
+─────
+# Single-GPU
+python train.py --train_arg_json arg_json/unet/beta_mnist2.json
+
+# Multi-GPU
+accelerate launch --num_processes 4 train.py --train_arg_json arg_json/jit/base.json
+
+# Resume
+python train.py --resume_ckpt_dir outputs/<run>
+"""
 
 import os
-import sys
 import shutil
 import random as rd
 import warnings
+import json
+import dataclasses
+from typing import Optional, List, Tuple
+
 import numpy as np
 import torch
-from torch import nn
-import torch.nn.functional as F
-from torchvision.datasets import CIFAR10, MNIST
-from torch.utils.data import DataLoader, TensorDataset
-import torchvision.transforms as T
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 import torchvision.transforms.functional as TF
 from torchvision.utils import make_grid
-import json
 import tqdm.auto as tqdm
-import dataclasses
-from contextlib import nullcontext
-from typing import Optional, List, Tuple, Type
 import wandb
 import fire
+from accelerate import Accelerator
 from diffusers.training_utils import EMAModel
 from transformers import get_scheduler as get_lr_scheduler
+from pytorch_fid.inception import InceptionV3
 
-from diffusion.scheduler import get_scheduler, BaseScheduler
-from diffusion.sampler import get_sampler, BaseSampler
-from modeling import get_model, BasePredictor
-from utils import count_parameters, get_augmentations
-from utils.fid import load_hidden_parameters, calculate_frechet_distance, \
-    calc_inception_features, inception_features_to_hidden_parameters
+from diffusion.scheduler import get_scheduler
+from diffusion.sampler import get_sampler
+from modeling import get_model
+from utils import count_parameters
+from utils.fid import (
+    load_hidden_parameters,
+    calculate_frechet_distance,
+    inception_features_to_hidden_parameters,
+)
 from utils.fid_infinity import fid_extrapolation
 from utils.validate_memo import calc_memorization_metric
+from utils.data import (
+    load_training_dataset,
+    make_generation_seed,
+    maybe_build_memorization_tensor,
+    FIDNoiseDataset,
+    image_shape as dataset_image_shape,
+    num_classes as dataset_num_classes,
+)
 
 
 WANDB_PROJECT_NAME = 'noh-diffusion'
 
 
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
 @dataclasses.dataclass
 class TrainArgs:
+    # --- run ---
     output_dir: str
     wandb_run_name: Optional[str] = None
     wandb_run_id: Optional[str] = None
 
+    # --- schedule ---
     max_steps: int = 100_000
     logging_steps: int = 50
     eval_steps: int = 1000
     save_steps: Optional[int] = None
     eval_n_examples: int = 40
-    guidance_scale: float = 1.0
-    # save_limits: Optional[int] = None
 
+    # --- FID ---
     fid_eval_steps: Optional[int] = None
     fid_ema: bool = True
     fid_reference_dataset: str = 'mnist-train'
-    fid_n_examples: int = 10000
-    generation_batch_size: int = 256
+    fid_n_examples: int = 10_000
+    fid_sample_labels: bool = False
+    generation_batch_size: int = 256    # per-GPU
     inception_batch_size: int = 512
     adjust_fid_n: bool = True
     fid_adjust_subsets: List[int] = dataclasses.field(
         default_factory=lambda: [4000, 6000, 8000, 10000])
 
-    batch_size: int = 128
+    # --- optim ---
+    batch_size: int = 128               # per-GPU when num_processes > 1
     lr: float = 2e-4
     lr_scheduler: Optional[str] = None
     lr_warmup_steps: int = 0
-    lr_schduler_cfg: dict = dataclasses.field(default_factory=dict)
+    lr_scheduler_cfg: dict = dataclasses.field(default_factory=dict)
     optimizer: str = 'adamw'
     adam_betas: Tuple[float, float] = (0.9, 0.99)
     clip_grad_norm: float = 1.0
 
+    # --- EMA ---
     use_ema: bool = True
     ema_inv_gamma: float = 1.0
     ema_power: float = 0.75
 
+    # --- data ---
     dataset: str = 'mnist'
     dataset_dir: str = 'datasets'
     augmentations: List[str] = dataclasses.field(default_factory=list)
+    image_size: Optional[int] = None
     dataloader_num_workers: int = 2
     dataloader_drop_last: bool = True
     dataloader_pin_memory: bool = True
 
-    device: str = 'cuda'
+    # --- misc ---
     seed: int = 42
-    bf16: bool = False
+    bf16: bool = True
+    compile: bool = False
 
+    # --- diffusion ---
     p_uncond: float = 0.2
+    class_conditioning: bool = False
+    guidance_scale: float = 1.0
+    cfg_interval: Optional[Tuple[float, float]] = None
     model_type: str = 'unet'
     model_cfg: dict = dataclasses.field(default_factory=dict)
     scheduler_type: str = 'beta'
@@ -92,6 +129,23 @@ class TrainArgs:
     sampler_type: str = 'ddim'
     sampler_cfg: dict = dataclasses.field(default_factory=dict)
 
+
+def _load_train_args(path: str) -> TrainArgs:
+    with open(path) as f:
+        d = json.load(f)
+    # Back-compat shims for legacy JSON files
+    if 'lr_schduler_cfg' in d:
+        d['lr_scheduler_cfg'] = d.pop('lr_schduler_cfg')
+    d.pop('device', None)
+    # Drop fields that exist in old train_args.json but not in the new dataclass
+    known = {f.name for f in dataclasses.fields(TrainArgs)}
+    d = {k: v for k, v in d.items() if k in known}
+    return TrainArgs(**d)
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
 def seed_everything(seed: Optional[int] = None):
     if seed is not None:
@@ -107,615 +161,589 @@ def seed_worker(worker_id):
     rd.seed(worker_seed)
 
 
-def load_dataset(dataset, data_dir, train=True, augumentations: Optional[List[str]] = None):
-    transform = get_augmentations(augumentations)
-    transform.extend([
-        T.ToTensor(),
-        T.Normalize(mean=0.5, std=0.5),
-    ])
-    transform = T.Compose(transform)
-
-    if dataset == 'cifar10':
-        dataset = CIFAR10(
-            data_dir,
-            transform=transform,
-            download=True,
-            train=train
-        )
-        data_tensor = torch.from_numpy(dataset.data).to(torch.float32).permute(0, 3, 1, 2)
-        data_tensor = data_tensor / 127.5 - 1  # scale to [-1, 1]
-    elif dataset == 'mnist':
-        dataset = MNIST(
-            data_dir,
-            transform=transform,
-            download=True,
-            train=train
-        )
-        data_tensor = dataset.data.unsqueeze(1).to(torch.float32)  # (N, 1, H, W)
-        data_tensor = data_tensor / 127.5 - 1  # scale to [-1, 1]
-    else:
-        raise ValueError(f'unknown dataset {dataset}')
-    
-    return dataset, data_tensor
+def fix_state_dict(state_dict):
+    """Strip _orig_mod. prefix added by torch.compile."""
+    return {
+        (k[len('_orig_mod.'):] if k.startswith('_orig_mod.') else k): v
+        for k, v in state_dict.items()
+    }
 
 
-def make_generation_seed(dataset, n_examples, seed=None, sample_labels=False):
-    def get_generator():
-        return torch.Generator().manual_seed(seed) if seed is not None else None
-    
-    if dataset == 'mnist':
-        image_shape = (1, 28, 28)
-        n_classes = 10
-    elif dataset == 'cifar10':
-        image_shape = (3, 32, 32)
-        n_classes = 10
-    else:
-        raise ValueError(f'unknown dataset {dataset}')
-    
-    z = torch.randn((n_examples, *image_shape), generator=get_generator())
-    if sample_labels:
-        cls = torch.randint(0, n_classes, (n_examples,), generator=get_generator())
-    else:
-        cls = torch.arange(n_examples) % n_classes
-
-    return {'z': z, 'cls': cls}
-
+# ---------------------------------------------------------------------------
+# Trainer
+# ---------------------------------------------------------------------------
 
 class Trainer:
     def __init__(
             self,
+            accelerator: Accelerator,
             arg: TrainArgs,
-            model: Type[BasePredictor],
-            scheduler: Type[BaseScheduler],
-            sampler: Optional[Type[BaseSampler]] = None,
+            model,
+            scheduler,
+            sampler,
             resume_ckpt_dir: Optional[str] = None,
             overwrite: bool = False,
     ):
-        if arg.dataloader_num_workers == 0:
-            warnings.warn(f'set dataloader_num_workers > 0 for reproducibility')
-
+        self.accelerator = accelerator
         self.arg = arg
-        self.model = model
         self.scheduler = scheduler
         self.sampler = sampler
 
-        print(f'Trainer arg:')
-        print(self.arg)
+        if arg.dataloader_num_workers == 0:
+            warnings.warn('set dataloader_num_workers > 0 for reproducibility')
 
+        accelerator.print(f'TrainArgs:\n{arg}')
+        accelerator.print(
+            f'num_processes: {accelerator.num_processes}  '
+            f'mixed_precision: {accelerator.mixed_precision}'
+        )
+
+        # ── Output directory (main process) ──────────────────────────────
+        # Normalise trailing slashes so "/foo/bar/" == "/foo/bar"
         self.resume_ckpt_dir = resume_ckpt_dir
-        if resume_ckpt_dir is not None:
-            assert resume_ckpt_dir == self.arg.output_dir, \
-                f'resume_ckpt_dir "{resume_ckpt_dir}" does not match arg.output_dir "{self.arg.output_dir}"'
-        else:
-            if os.path.exists(self.arg.output_dir) and len(os.listdir(self.arg.output_dir)) > 0:
-                if not overwrite:
-                    overwrite_msj = f'\n"{self.arg.output_dir}" already exists and is not empty, overwrite? (Y/n): '
-                    user_input = input(overwrite_msj)
-                    if user_input.lower().strip() != 'y':
-                        raise ValueError(f'"{self.arg.output_dir}" already exists and is not empty')
-                    
-                print(f'overwriting "{self.arg.output_dir}"...\n')
-                shutil.rmtree(self.arg.output_dir)
+        if accelerator.is_main_process:
+            if resume_ckpt_dir is not None:
+                assert os.path.normpath(resume_ckpt_dir) == os.path.normpath(arg.output_dir), (
+                    f'resume_ckpt_dir must equal output_dir; '
+                    f'got "{resume_ckpt_dir}" vs "{arg.output_dir}"'
+                )
+            else:
+                if os.path.exists(arg.output_dir) and os.listdir(arg.output_dir):
+                    if not overwrite:
+                        ans = input(f'\n"{arg.output_dir}" is not empty, overwrite? (Y/n): ')
+                        if ans.lower().strip() != 'y':
+                            raise ValueError(f'"{arg.output_dir}" exists and is not empty')
+                    print(f'Overwriting "{arg.output_dir}"...\n')
+                    shutil.rmtree(arg.output_dir)
+            os.makedirs(arg.output_dir, exist_ok=True)
+            with open(os.path.join(arg.output_dir, 'train_args.json'), 'w') as f:
+                json.dump(dataclasses.asdict(arg), f, indent=2)
+        accelerator.wait_for_everyone()
 
+        # ── Wandb (main process) ─────────────────────────────────────────
         self.wandb_run = None
-        if self.arg.wandb_run_name is not None or self.arg.wandb_run_id is not None:
-            self.prepare_wandb_run(self.arg.wandb_run_name)
-        
-        os.makedirs(self.arg.output_dir, exist_ok=True)
-        with open(os.path.join(self.arg.output_dir, 'train_args.json'), 'w') as f:
-            json.dump(dataclasses.asdict(self.arg), f, indent=2)
+        if accelerator.is_main_process and (arg.wandb_run_name or arg.wandb_run_id):
+            self._prepare_wandb_run(arg.wandb_run_name)
 
-        self.device = torch.device(self.arg.device)
-        print(f'using device: {self.device}')
+        # ── Compile (before DDP wrapping) ────────────────────────────────
+        if arg.compile:
+            accelerator.print('Compiling model...')
+            model = torch.compile(model)
+            accelerator.print('Model compiled.')
 
-        self.model.to(self.device)
+        # ── EMA (track raw params before DDP) ───────────────────────────
         self.ema_model = None
-        if self.arg.use_ema:
+        if arg.use_ema:
             self.ema_model = EMAModel(
-                self.model.parameters(),
+                model.parameters(),
                 use_ema_warmup=True,
-                inv_gamma=self.arg.ema_inv_gamma,
-                power=self.arg.ema_power,
+                inv_gamma=arg.ema_inv_gamma,
+                power=arg.ema_power,
             )
-            self.ema_model.to(self.device)
 
-        self.global_steps = 0
-        self.steps_in_epoch = 0
-        self.epochs = 0
-
-        self.dataset, self.train_data_tensor = self.get_train_dataset()
-        self.dataloader = self.get_train_dataloader()
-        self.steps_per_epoch = len(self.dataloader)
-        print(f'steps per epoch: {self.steps_per_epoch}')
-
-        self.valid_dataset = self.get_valid_dataset()
-        self.valid_dataloader = self.get_valid_dataloader()
-
-        self.optimizer = self.get_optimizer()
-        self.lr_scheduler = self.get_lr_scheduler(self.optimizer)
-
-        self.eval_seed = make_generation_seed(
-            self.arg.dataset,
-            self.arg.eval_n_examples, 
-            seed=self.arg.seed,
-            sample_labels=False,
-        )
-
-        self.fid_seed = None
-        self.fid_refence = None
-        if self.arg.fid_eval_steps is not None:
-            if self.arg.adjust_fid_n:
-                assert self.arg.fid_n_examples == max(self.arg.fid_adjust_subsets), \
-                    f'fid_n_examples must be equal to max(adjust_subsets) for FID extrapolation'
-                self.arg.fid_adjust_subsets.sort()
-                
-            fid_seed = make_generation_seed(
-                self.arg.dataset, 
-                self.arg.fid_n_examples, 
-                seed=self.arg.seed,
-                sample_labels=True,
-            )
-            self.fid_seed = TensorDataset(fid_seed['z'], fid_seed['cls'])
-            self.fid_refence = load_hidden_parameters(self.arg.fid_reference_dataset, save=False)
-
-        self.ckpt_base_dir = None
-        if self.arg.save_steps is not None:
-            self.ckpt_base_dir = os.path.join(self.arg.output_dir, 'ckpts')
-        self.saved_ckpt_paths = []
-    
-    def mixed_precision_context(self):
-        if self.arg.bf16:
-            context = torch.autocast(self.device.type, dtype=torch.bfloat16)
-        else:
-            context = nullcontext()
-        return context
-
-    def get_optimizer(self):
-        if self.arg.optimizer == 'adam':
-            optim_cls = torch.optim.Adam
-        elif self.arg.optimizer == 'adamw':
-            optim_cls = torch.optim.AdamW
-        else:
-            raise ValueError(f'unknown optimizer {self.arg.optimizer}')
-
-        optim = optim_cls(
-            self.model.parameters(),
-            lr=self.arg.lr,
-            betas=self.arg.adam_betas
-        )
-        print(f'optimizer ready')
-        return optim
-
-    def get_lr_scheduler(self, optim):
-        if self.arg.lr_scheduler is None:
-            return None
-        lr_scheduler = get_lr_scheduler(
-            self.arg.lr_scheduler,
-            optimizer=optim,
-            num_warmup_steps=self.arg.lr_warmup_steps,
-            num_training_steps=self.arg.max_steps,
-            **self.arg.lr_schduler_cfg,
-        )
-        return lr_scheduler
-
-    def get_train_dataset(self):
-        dataset, data_tensor = load_dataset(
-            self.arg.dataset,
-            self.arg.dataset_dir, 
+        # ── Datasets ────────────────────────────────────────────────────
+        self.train_dataset = load_training_dataset(
+            arg.dataset, arg.dataset_dir,
             train=True,
-            augumentations=self.arg.augmentations
+            augmentations=arg.augmentations,
+            image_size=arg.image_size,
         )
-        print(f'dataset ready: {dataset}')
-        return dataset, data_tensor
-    
-    def get_valid_dataset(self):
-        dataset, _ = load_dataset(
-            self.arg.dataset,
-            self.arg.dataset_dir, 
-            train=False,
+        self.valid_dataset = load_training_dataset(
+            arg.dataset, arg.dataset_dir, train=False,
         )
-        print(f'validation dataset ready: {dataset}')
-        return dataset
+        accelerator.print(f'Train dataset: {len(self.train_dataset)} samples')
 
-    def get_train_dataloader(self, dataset=None):
-        if dataset is None:
-            dataset = self.dataset
-
+        # ── DataLoaders ─────────────────────────────────────────────────
         rng = torch.Generator()
-        rng.manual_seed(self.arg.seed)
-        loader = DataLoader(
-            dataset,
-            batch_size=self.arg.batch_size,
+        rng.manual_seed(arg.seed)
+        train_loader = DataLoader(
+            self.train_dataset,
+            batch_size=arg.batch_size,
             shuffle=True,
-            drop_last=self.arg.dataloader_drop_last,
-            pin_memory=self.arg.dataloader_pin_memory,
-            num_workers=self.arg.dataloader_num_workers,
+            drop_last=arg.dataloader_drop_last,
+            pin_memory=arg.dataloader_pin_memory,
+            num_workers=arg.dataloader_num_workers,
             worker_init_fn=seed_worker,
             generator=rng,
         )
-        print(f'dataloader ready')
-        return loader
-    
-    def get_valid_dataloader(self):
-        loader = DataLoader(
+        valid_loader = DataLoader(
             self.valid_dataset,
-            batch_size=self.arg.batch_size,
+            batch_size=arg.generation_batch_size,
             shuffle=False,
             drop_last=False,
-            pin_memory=self.arg.dataloader_pin_memory,
-            num_workers=self.arg.dataloader_num_workers,
+            pin_memory=arg.dataloader_pin_memory,
+            num_workers=arg.dataloader_num_workers,
         )
-        print(f'validation dataloader ready')
-        return loader
 
+        # ── Optimizer & LR scheduler ────────────────────────────────────
+        optimizer = self._make_optimizer(model)
+        lr_sched_obj = self._make_lr_scheduler(optimizer)
 
-    def prepare_wandb_run(self, run_name):
+        # ── Accelerate prepare ──────────────────────────────────────────
+        prepare_args = [model, optimizer, train_loader, valid_loader]
+        if lr_sched_obj is not None:
+            prepare_args.append(lr_sched_obj)
+
+        prepared = accelerator.prepare(*prepare_args)
+        self.model            = prepared[0]
+        self.optimizer        = prepared[1]
+        self.train_dataloader = prepared[2]
+        self.valid_dataloader = prepared[3]
+        self.lr_scheduler     = prepared[4] if lr_sched_obj is not None else None
+
+        self.raw_model = accelerator.unwrap_model(self.model)
+        if self.ema_model is not None:
+            self.ema_model.to(accelerator.device)
+
+        self.steps_per_epoch = len(self.train_dataloader)
+        accelerator.print(f'Steps per epoch: {self.steps_per_epoch}')
+
+        # ── Counters ────────────────────────────────────────────────────
+        self.global_steps   = 0
+        self.epochs         = 0
+        self.steps_in_epoch = 0
+
+        # ── Eval seed ───────────────────────────────────────────────────
+        self.eval_seed = make_generation_seed(
+            arg.dataset, arg.eval_n_examples, seed=arg.seed, sample_labels=False,
+        )
+
+        # ── FID setup ───────────────────────────────────────────────────
+        self.fid_dataset  = None
+        self.fid_reference = None
+        if arg.fid_eval_steps is not None:
+            if arg.adjust_fid_n:
+                assert arg.fid_n_examples == max(arg.fid_adjust_subsets), (
+                    'fid_n_examples must equal max(fid_adjust_subsets) for FID extrapolation')
+                arg.fid_adjust_subsets.sort()
+
+            img_shape = dataset_image_shape(arg.dataset)
+            n_cls     = dataset_num_classes(arg.dataset)
+            self.fid_dataset = FIDNoiseDataset(
+                n_samples=arg.fid_n_examples,
+                image_shape=img_shape,
+                class_condition=arg.class_conditioning,
+                n_classes=n_cls,
+                sample_labels=arg.fid_sample_labels,
+                seed=arg.seed,
+            )
+            self.fid_reference = load_hidden_parameters(arg.fid_reference_dataset, save=False)
+
+        # ── Memorization tensor (small datasets only) ────────────────────
+        self.memo_tensor = maybe_build_memorization_tensor(arg.dataset, self.train_dataset)
+
+        # ── Checkpoint dir ──────────────────────────────────────────────
+        self.ckpt_base_dir = (
+            os.path.join(arg.output_dir, 'ckpts') if arg.save_steps else None
+        )
+
+    # ── Setup helpers ────────────────────────────────────────────────────
+
+    def _make_optimizer(self, model):
+        cls = {'adam': torch.optim.Adam, 'adamw': torch.optim.AdamW}[self.arg.optimizer]
+        return cls(model.parameters(), lr=self.arg.lr, betas=self.arg.adam_betas)
+
+    def _make_lr_scheduler(self, optimizer):
+        if self.arg.lr_scheduler is None:
+            return None
+        return get_lr_scheduler(
+            self.arg.lr_scheduler,
+            optimizer=optimizer,
+            num_warmup_steps=self.arg.lr_warmup_steps,
+            num_training_steps=self.arg.max_steps,
+            **self.arg.lr_scheduler_cfg,
+        )
+
+    def _prepare_wandb_run(self, run_name):
         if self.arg.wandb_run_id is not None:
             self.wandb_run = wandb.init(
-                project=WANDB_PROJECT_NAME,
-                id=self.arg.wandb_run_id,
-                resume='must',
-            )
+                project=WANDB_PROJECT_NAME, id=self.arg.wandb_run_id, resume='must')
         else:
-            cfg = dataclasses.asdict(self.arg)
             self.wandb_run = wandb.init(
-                name=run_name,
-                project=WANDB_PROJECT_NAME,
-                config=cfg,
+                name=run_name, project=WANDB_PROJECT_NAME,
+                config=dataclasses.asdict(self.arg),
                 dir=self.arg.output_dir,
             )
             self.arg.wandb_run_id = self.wandb_run.id
-        print(f'Wandb - run name: {self.wandb_run.name}, id: {self.wandb_run.id}')
+        self.accelerator.print(
+            f'Wandb run: {self.wandb_run.name}  id: {self.wandb_run.id}')
 
+    # ── Checkpoint ───────────────────────────────────────────────────────
 
-    def save_ckpt(self, ckpt_dir):
+    def save_ckpt(self, ckpt_dir: str):
+        """Save EMA-merged model weights as model.pt (main process only).
+        If no EMA, saves raw weights instead."""
+        if not self.accelerator.is_main_process:
+            return
         os.makedirs(ckpt_dir, exist_ok=True)
-        
-        torch.save(self.model.state_dict(), os.path.join(ckpt_dir, 'model.pt'))
-        if self.ema_model is not None:
-            self.ema_model.store(self.model.parameters())
-            self.ema_model.copy_to(self.model.parameters())
-            torch.save(self.model.state_dict(), os.path.join(ckpt_dir, 'ema_model.pt'))
-            self.ema_model.restore(self.model.parameters())
 
-        print(f'saved ckpt {ckpt_dir}')
+        if self.ema_model is not None:
+            self.ema_model.store(self.raw_model.parameters())
+            self.ema_model.copy_to(self.raw_model.parameters())
+
+        sd = self.raw_model.state_dict()
+        if self.arg.compile:
+            sd = fix_state_dict(sd)
+        torch.save(sd, os.path.join(ckpt_dir, 'model.pt'))
+
+        if self.ema_model is not None:
+            self.ema_model.restore(self.raw_model.parameters())
+
+        self.accelerator.print(f'Saved ckpt → {ckpt_dir}')
 
     def save_latest_ckpt(self):
-        latest_ckpt_path = os.path.join(self.arg.output_dir, 'latest.pt')
-        ckpt = {
-            'global_steps': self.global_steps,
-            'epochs': self.epochs,
-            'steps_in_epoch': self.steps_in_epoch,
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            'rng_state': torch.get_rng_state(),
-            'cuda_rng_state': torch.cuda.get_rng_state(),
-            'np_rng_state': np.random.get_state(),
-            'rd_rng_state': rd.getstate(),
-        }
-        if self.ema_model is not None:
-            ckpt['ema_model_state_dict'] = self.ema_model.state_dict()
-        if self.lr_scheduler is not None:
-            ckpt['lr_scheduler_state_dict'] = self.lr_scheduler.state_dict()
-        torch.save(ckpt, latest_ckpt_path)
-    
-    def load_latest_ckpt(self, ckpt_dir):
-        latest_ckpt_path = os.path.join(ckpt_dir, 'latest.pt')
-        ckpt = torch.load(latest_ckpt_path, weights_only=False)
-        print(ckpt.keys())
+        """Save full training state for resumption (all processes)."""
+        latest_dir = os.path.join(self.arg.output_dir, 'latest_state')
+        os.makedirs(latest_dir, exist_ok=True)
+        self.accelerator.save_state(latest_dir)
 
-        self.global_steps = ckpt['global_steps']
-        self.epochs = ckpt['epochs']
-        self.steps_in_epoch = ckpt['steps_in_epoch']
+        if self.accelerator.is_main_process:
+            extra = {
+                'global_steps':   self.global_steps,
+                'epochs':         self.epochs,
+                'steps_in_epoch': self.steps_in_epoch,
+            }
+            if self.ema_model is not None:
+                extra['ema_state_dict'] = self.ema_model.state_dict()
+            torch.save(extra, os.path.join(latest_dir, 'extra.pt'))
 
-        self.model.load_state_dict(ckpt['model_state_dict'])
-        self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        if self.ema_model is not None:
-            self.ema_model.load_state_dict(ckpt['ema_model_state_dict'])
-        if self.lr_scheduler is not None:
-            self.lr_scheduler.load_state_dict(ckpt['lr_scheduler_state_dict'])
+        self.accelerator.wait_for_everyone()
 
-        torch.set_rng_state(ckpt['rng_state'])
-        torch.cuda.set_rng_state(ckpt['cuda_rng_state'])
-        np.random.set_state(ckpt['np_rng_state'])
-        rd.setstate(ckpt['rd_rng_state'])
+    def load_latest_ckpt(self, ckpt_dir: str):
+        """Load full training state (all processes)."""
+        latest_dir = os.path.join(ckpt_dir, 'latest_state')
+        self.accelerator.load_state(latest_dir)
 
-        print(f'loaded latest ckpt from {latest_ckpt_path}')
-
-
-    def log(self, steps, **logs):
-        with open(os.path.join(self.arg.output_dir, 'train_log.jsonl'), 'a') as f:
-            f.write(json.dumps(dict(steps=steps, **logs)) + '\n')
-        if self.wandb_run is not None:
-            logs.update({
-                'global_steps': steps,
-                'epochs': steps / self.steps_per_epoch,
-            })
-            self.wandb_run.log(logs, step=steps)
-
-
-    def train_on_batch(self, x, label=None):
-        uncond_mask = None
-        if label is not None:
-            uncond_mask = torch.bernoulli(self.arg.p_uncond * torch.ones_like(label))
-
-        with self.mixed_precision_context():
-            loss = self.scheduler.get_loss(x, self.model, cls=label, uncond_mask=uncond_mask)
-
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(),
-            self.arg.clip_grad_norm
+        extra = torch.load(
+            os.path.join(latest_dir, 'extra.pt'),
+            map_location='cpu', weights_only=False,
         )
+        self.global_steps   = extra['global_steps']
+        self.epochs         = extra['epochs']
+        self.steps_in_epoch = extra['steps_in_epoch']
+        if self.ema_model is not None and 'ema_state_dict' in extra:
+            self.ema_model.load_state_dict(extra['ema_state_dict'])
+            self.ema_model.to(self.accelerator.device)  # state_dict loads to CPU
+
+        self.accelerator.print(
+            f'Resumed from step {self.global_steps} (epoch {self.epochs})')
+        self.accelerator.wait_for_everyone()
+
+    # ── Logging ──────────────────────────────────────────────────────────
+
+    def log(self, steps: int, **logs):
+        if not self.accelerator.is_main_process:
+            return
+        with open(os.path.join(self.arg.output_dir, 'train_log.jsonl'), 'a') as f:
+            f.write(json.dumps({'steps': steps, **logs}) + '\n')
+        if self.wandb_run is not None:
+            self.wandb_run.log(
+                {'global_steps': steps, 'epochs': steps / self.steps_per_epoch, **logs},
+                step=steps,
+            )
+
+    # ── Training step ────────────────────────────────────────────────────
+
+    def train_on_batch(self, batch) -> float:
+        x = batch['image'].to(self.accelerator.device)
+
+        cond = None
+        uncond_mask = None
+        if self.arg.class_conditioning and 'label' in batch:
+            cond = batch['label'].to(self.accelerator.device)
+            if self.arg.p_uncond > 0:
+                uncond_mask = torch.rand(cond.shape, device=cond.device) < self.arg.p_uncond
+
+        with self.accelerator.autocast():
+            loss = self.scheduler.get_loss(
+                x, self.raw_model,
+                cond=cond,
+                uncond_mask=uncond_mask,
+            )
+
+        self.accelerator.backward(loss)
+        if self.arg.clip_grad_norm is not None:
+            self.accelerator.clip_grad_norm_(
+                self.model.parameters(), self.arg.clip_grad_norm)
         self.optimizer.step()
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
-        self.model.zero_grad()
+        self.optimizer.zero_grad()
         if self.ema_model is not None:
-            self.ema_model.step(self.model.parameters())
+            self.ema_model.step(self.raw_model.parameters())
 
-        return loss.item()
-    
+        return loss.detach().item()
+
+    # ── Evaluation ───────────────────────────────────────────────────────
+
     @torch.no_grad()
-    def generate_eval_examples(self):
-        self.model.eval()
+    def generate_eval_examples(self) -> dict:
+        """Generate a fixed grid of images. Main process only."""
+        if not self.accelerator.is_main_process:
+            return {}
 
-        z, cls = self.eval_seed['z'].to(self.device), self.eval_seed['cls'].to(self.device)
-        pred_fn = self.model.get_pred_fn(cond=cls, guidance_scale=self.arg.guidance_scale)
-        with self.mixed_precision_context():
-            samples = self.sampler.sample(z, self.scheduler, pred_fn)
-        samples = torch.clip(samples, -1, 1).cpu()
-        ret = {'examples': samples}
-        
+        self.raw_model.eval()
+        z    = self.eval_seed['z'].to(self.accelerator.device)
+        cond = (self.eval_seed['cls'].to(self.accelerator.device)
+                if self.arg.class_conditioning and 'cls' in self.eval_seed else None)
+
+        with self.accelerator.autocast():
+            samples = self.sampler.sample(z, self.raw_model, cond=cond)
+        result = {'examples': torch.clamp(samples, -1, 1).cpu()}
+
         if self.ema_model is not None:
-            self.ema_model.store(self.model.parameters())
-            self.ema_model.copy_to(self.model.parameters())
+            self.ema_model.store(self.raw_model.parameters())
+            self.ema_model.copy_to(self.raw_model.parameters())
+            with self.accelerator.autocast():
+                ema_samples = self.sampler.sample(z, self.raw_model, cond=cond)
+            result['ema_examples'] = torch.clamp(ema_samples, -1, 1).cpu()
+            self.ema_model.restore(self.raw_model.parameters())
 
-            with self.mixed_precision_context():
-                ema_samples = self.sampler.sample(z, self.scheduler, pred_fn)
-            ema_samples = torch.clip(ema_samples, -1, 1).cpu()
-            ret['ema_examples'] = ema_samples
-
-            self.ema_model.restore(self.model.parameters())
-
-        return ret
-    
-    @torch.no_grad()
-    def generate_fid_samples(self):
-        self.model.eval()
-        
-        dataloader = DataLoader(
-            self.fid_seed, 
-            num_workers=1, 
-            batch_size=self.arg.generation_batch_size, 
-            shuffle=False, 
-            drop_last=False
-        )
-        generated = []
-
-        if self.arg.fid_ema and self.ema_model is not None:
-            self.ema_model.store(self.model.parameters())
-            self.ema_model.copy_to(self.model.parameters())
-
-        for z, cls in tqdm.tqdm(dataloader, leave=False, desc='generating fid samples'):
-            z, cls = z.to(self.device), cls.to(self.device)
-            pred_fn = self.model.get_pred_fn(cond=cls, guidance_scale=self.arg.guidance_scale)
-            
-            with self.mixed_precision_context():
-                samples = self.sampler.sample(z, self.scheduler, pred_fn)
-
-            samples = torch.clip(samples, -1, 1).cpu()
-            generated.append(samples)
-        
-        if self.arg.fid_ema and self.ema_model is not None:
-            self.ema_model.restore(self.model.parameters())
-        
-        generated = torch.cat(generated, dim=0)
-        return generated
+        self.raw_model.train()
+        return result
 
     @torch.no_grad()
-    def evaluate_fid(self):
-        generated = self.generate_fid_samples()
-        inception_features = calc_inception_features(
-            generated,
-            batch_size=self.arg.inception_batch_size,
-            device=self.device,
+    def evaluate_validation_loss(self) -> dict:
+        """Compute validation loss across all GPUs (all-reduce)."""
+        self.raw_model.eval()
+
+        def _loss_over_loader(model):
+            loss_sum = torch.zeros(1, device=self.accelerator.device)
+            for batch in self.valid_dataloader:
+                x = batch['image'].to(self.accelerator.device)
+                cond = (batch['label'].to(self.accelerator.device)
+                        if self.arg.class_conditioning and 'label' in batch else None)
+                with self.accelerator.autocast():
+                    loss = self.scheduler.get_loss(x, model, cond=cond)
+                loss_sum += loss.detach() * x.size(0)
+            total = self.accelerator.reduce(loss_sum, reduction='sum')
+            return (total / len(self.valid_dataset)).item()
+
+        result = {'loss': _loss_over_loader(self.raw_model)}
+
+        if self.ema_model is not None:
+            self.ema_model.store(self.raw_model.parameters())
+            self.ema_model.copy_to(self.raw_model.parameters())
+            result['ema_loss'] = _loss_over_loader(self.raw_model)
+            self.ema_model.restore(self.raw_model.parameters())
+
+        self.raw_model.train()
+        return result
+
+    @torch.no_grad()
+    def evaluate_fid_streaming(self) -> Optional[dict]:
+        """Streaming multi-GPU FID.
+
+        Each GPU generates its shard of FIDNoiseDataset, immediately runs
+        Inception, then features are all-gathered.  Main process computes FID.
+        """
+        torch.cuda.empty_cache()
+
+        dist_sampler = DistributedSampler(
+            self.fid_dataset,
+            num_replicas=self.accelerator.num_processes,
+            rank=self.accelerator.process_index,
+            shuffle=False,
+            drop_last=False,
+        )
+        loader = DataLoader(
+            self.fid_dataset,
+            batch_size=self.arg.generation_batch_size,
+            sampler=dist_sampler,
+            num_workers=1,
+            drop_last=False,
+            pin_memory=False,
         )
 
-        ret = {}
+        inception = InceptionV3(
+            [InceptionV3.BLOCK_INDEX_BY_DIM[2048]], normalize_input=False
+        ).to(self.accelerator.device).eval()
+
+        self.raw_model.eval()
+        if self.ema_model is not None and self.arg.fid_ema:
+            self.ema_model.store(self.raw_model.parameters())
+            self.ema_model.copy_to(self.raw_model.parameters())
+
+        local_features = []
+        pbar = tqdm.tqdm(
+            loader,
+            desc=f'FID [rank {self.accelerator.process_index}]',
+            leave=False,
+            disable=not self.accelerator.is_main_process,
+        )
+        for batch in pbar:
+            z    = batch['z'].to(self.accelerator.device)
+            cond = (batch['cls'].to(self.accelerator.device)
+                    if self.arg.class_conditioning and 'cls' in batch else None)
+            with self.accelerator.autocast():
+                samples = self.sampler.sample(z, self.raw_model, cond=cond)
+            samples = torch.clamp(samples, -1, 1)
+            feats = inception(samples.float())[0].flatten(1)
+            local_features.append(feats.cpu())
+
+        if self.ema_model is not None and self.arg.fid_ema:
+            self.ema_model.restore(self.raw_model.parameters())
+        self.raw_model.train()
+
+        del inception
+        torch.cuda.empty_cache()
+
+        local_tensor  = torch.cat(local_features, dim=0).to(self.accelerator.device)
+        all_features  = self.accelerator.gather(local_tensor)
+
+        if not self.accelerator.is_main_process:
+            return None
+
+        features = all_features[:self.arg.fid_n_examples].float().cpu().numpy()
+        self.accelerator.print(f'Gathered inception features: {features.shape}')
+
+        result = {}
         if self.arg.adjust_fid_n:
-            fid_result = fid_extrapolation(
-                inception_features,
-                ref_mu=self.fid_refence[0],
-                ref_sigma=self.fid_refence[1],
+            fid_out = fid_extrapolation(
+                features,
+                ref_mu=self.fid_reference[0],
+                ref_sigma=self.fid_reference[1],
                 subset_sizes=self.arg.fid_adjust_subsets,
                 target_n=50_000,
             )
-            ret['FID'] = fid_result['fids'][-1]
-            ret['FID@inf'] = fid_result['fid_infinity']
-            ret['FID@50k'] = fid_result['fid_target']
+            result['FID']     = fid_out['fids'][-1]
+            result['FID@inf'] = fid_out['fid_infinity']
+            result['FID@50k'] = fid_out['fid_target']
         else:
-            mu, sigma = inception_features_to_hidden_parameters(inception_features)
-            fid = calculate_frechet_distance(mu, sigma, self.fid_refence[0], self.fid_refence[1])
-            ret['FID'] = fid.item()
-
-        mem_ratio, *_ = calc_memorization_metric(
-            generated,
-            self.train_data_tensor,
-            device=self.device,
-        )
-        ret['memorization_ratio'] = mem_ratio.item()
-        print(f'evaluated FID: {ret["FID"]:.4f}, memorization_ratio: {ret["memorization_ratio"]:.4f}')
+            mu, sigma = inception_features_to_hidden_parameters(features)
+            result['FID'] = calculate_frechet_distance(
+                mu, sigma, self.fid_reference[0], self.fid_reference[1])
 
         with open(os.path.join(self.arg.output_dir, 'fid_evaluations.jsonl'), 'a') as f:
-            ret_with_steps = dict(steps=self.global_steps, **ret)
-            f.write(json.dumps(ret_with_steps) + '\n')
+            f.write(json.dumps({'steps': self.global_steps, **result}) + '\n')
 
-        if self.wandb_run is not None:
-            self.wandb_run.log(ret, step=self.global_steps)
-    
-    @torch.no_grad()
-    def evaluate_validation_loss(self):
-        self.model.eval()
-
-        def get_eval_loss():
-            loss_sum = 0
-            gen = torch.Generator(device=self.device).manual_seed(self.arg.seed)
-            for x, cls in tqdm.tqdm(self.valid_dataloader, leave=False, desc='evaluating validation loss'):
-                batch_size = x.size(0)
-                x, cls = x.to(self.device), cls.to(self.device)
-                
-                with self.mixed_precision_context():
-                    loss = self.scheduler.get_loss(x, self.model, gen=gen, cls=cls)
-                    
-                loss_sum += loss.item() * batch_size
-            mean_loss = loss_sum / len(self.valid_dataset)
-            return mean_loss
-        
-        result = {'loss': get_eval_loss()}
-        if self.ema_model is not None:
-            self.ema_model.store(self.model.parameters())
-            self.ema_model.copy_to(self.model.parameters())
-            result['ema_loss'] = get_eval_loss()
-            self.ema_model.restore(self.model.parameters())
-
+        self.accelerator.print(f'FID: {result["FID"]:.4f}')
         return result
 
-
-    def evaluate(self, steps):
-        save_dir = os.path.join(self.arg.output_dir, f'examples')
-        os.makedirs(save_dir, exist_ok=True)
-
-        def save_samples(samples, name):
-            grid_image = TF.to_pil_image(
-                make_grid(samples, nrow=10, normalize=True, value_range=(-1, 1)))
-            save_path = os.path.join(save_dir, f'{steps:06d}_{name}.png')
-            grid_image.save(save_path)
-            return grid_image
-
+    def evaluate(self, steps: int):
+        """Image grids (main process) + validation loss (all GPUs)."""
         examples = self.generate_eval_examples()
-        image_log = {}
-        for k, v in examples.items():
-            img = save_samples(v, k)
-            image_log[k] = wandb.Image(img)
-        loss_log = {f'val/{k}': v for k, v in self.evaluate_validation_loss().items()}
+        if self.accelerator.is_main_process and examples:
+            save_dir = os.path.join(self.arg.output_dir, 'examples')
+            os.makedirs(save_dir, exist_ok=True)
+            image_log = {}
+            for name, imgs in examples.items():
+                grid = TF.to_pil_image(
+                    make_grid(imgs, nrow=10, normalize=True, value_range=(-1, 1)))
+                grid.save(os.path.join(save_dir, f'{steps:06d}_{name}.png'))
+                image_log[name] = wandb.Image(grid)
+            if self.wandb_run is not None:
+                self.wandb_run.log(
+                    {'global_steps': steps,
+                     'epochs': steps / self.steps_per_epoch,
+                     **image_log},
+                    step=steps,
+                )
 
-        if self.wandb_run is not None:
-            logs = {
-                'global_steps': steps,
-                'epochs': steps / self.steps_per_epoch,
-            }
-            logs.update(**image_log)
-            logs.update(**loss_log)
-            self.wandb_run.log(logs, step=steps)
+        val_loss = self.evaluate_validation_loss()
+        self.log(steps, **{f'val/{k}': v for k, v in val_loss.items()})
 
-    def skip_previous_steps(self):
-        print(f'skipping {self.epochs} epochs {self.steps_in_epoch} steps...')
-        for _ in tqdm.tqdm(range(self.epochs), leave=False):
-            next(iter(self.dataloader))
-        iterator = iter(self.dataloader)
-        for _ in tqdm.tqdm(range(self.steps_in_epoch), leave=False):
-            next(iterator)
-        return iterator
+    # ── Main training loop ────────────────────────────────────────────────
 
     def train(self):
         if self.resume_ckpt_dir is not None:
             self.load_latest_ckpt(self.resume_ckpt_dir)
 
-        if self.global_steps > 0:
-            iterator = self.skip_previous_steps()
-        else:
-            iterator = None
-
-        print('train start')
-
         self.model.train()
 
-        with tqdm.tqdm(initial=self.global_steps, total=self.arg.max_steps) as pbar:
+        with tqdm.tqdm(
+            initial=self.global_steps,
+            total=self.arg.max_steps,
+            disable=not self.accelerator.is_main_process,
+        ) as pbar:
             while self.global_steps < self.arg.max_steps:
-                if iterator is None:
-                    iterator = iter(self.dataloader)
-                    
-                for x, cls in iterator:
-                    x, cls = x.to(self.device), cls.to(self.device)
-                    loss = self.train_on_batch(x, cls)
-
-                    self.global_steps += 1
-                    self.epochs = self.global_steps // self.steps_per_epoch
-                    self.steps_in_epoch = self.global_steps % self.steps_per_epoch
+                for batch in self.train_dataloader:
+                    loss = self.train_on_batch(batch)
+                    self.global_steps   += 1
+                    self.epochs          = self.global_steps // self.steps_per_epoch
+                    self.steps_in_epoch  = self.global_steps % self.steps_per_epoch
                     pbar.update(1)
-                    
-                    if self.global_steps % self.arg.logging_steps == 0:
-                        pbar.set_postfix({'loss': f'{loss:.5f}'})
 
+                    if self.global_steps % self.arg.logging_steps == 0:
+                        if self.accelerator.is_main_process:
+                            pbar.set_postfix({'loss': f'{loss:.5f}'})
                         logs = {'loss': loss}
                         if self.ema_model is not None:
                             logs['ema_decay'] = self.ema_model.cur_decay_value
                         if self.lr_scheduler is not None:
                             logs['lr'] = self.lr_scheduler.get_last_lr()[0]
-                        self.log(
-                            self.global_steps,
-                            **logs
-                        )
-                    
+                        self.log(self.global_steps, **logs)
+
                     if self.global_steps % self.arg.eval_steps == 0:
                         self.evaluate(self.global_steps)
                         self.model.train()
-                    
-                    if self.ckpt_base_dir is not None and self.global_steps % self.arg.save_steps == 0:
-                        ckpt_dir = os.path.join(self.ckpt_base_dir, f'ckpt-{self.global_steps:06d}')
+
+                    if (self.ckpt_base_dir is not None
+                            and self.global_steps % self.arg.save_steps == 0):
+                        ckpt_dir = os.path.join(
+                            self.ckpt_base_dir, f'ckpt-{self.global_steps:06d}')
                         self.save_ckpt(ckpt_dir)
                         self.save_latest_ckpt()
-                    
-                    if self.arg.fid_eval_steps is not None and self.global_steps % self.arg.fid_eval_steps == 0:
-                        self.evaluate_fid()
+
+                    if (self.arg.fid_eval_steps is not None
+                            and self.global_steps % self.arg.fid_eval_steps == 0):
+                        fid_result = self.evaluate_fid_streaming()
+                        if self.accelerator.is_main_process and fid_result:
+                            self.log(self.global_steps, **fid_result)
+                        self.accelerator.wait_for_everyone()
                         self.model.train()
 
                     if self.global_steps >= self.arg.max_steps:
                         break
 
-                iterator = None
-
-        print('train done')
+        self.accelerator.print('Training complete.')
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main(
         train_arg_json: Optional[str] = None,
         resume_ckpt_dir: Optional[str] = None,
         overwrite: bool = False,
 ):
-    assert train_arg_json is not None or resume_ckpt_dir is not None
-    if resume_ckpt_dir is not None:
-        print(f'loading train args from resume ckpt dir "{resume_ckpt_dir}"')
+    assert train_arg_json is not None or resume_ckpt_dir is not None, \
+        'provide --train_arg_json or --resume_ckpt_dir'
+
+    if resume_ckpt_dir is not None and train_arg_json is None:
         train_arg_json = os.path.join(resume_ckpt_dir, 'train_args.json')
 
-    print(train_arg_json)
-    with open(train_arg_json, 'r') as f:
-        train_args = TrainArgs(**json.load(f))
+    arg = _load_train_args(train_arg_json)
 
-    seed_everything(train_args.seed)
-    
-    model = get_model(train_args.model_type, **train_args.model_cfg)
-    scheduler = get_scheduler(train_args.scheduler_type, **train_args.scheduler_cfg)
-    sampler = get_sampler(train_args.sampler_type, **train_args.sampler_cfg)
+    accelerator = Accelerator(mixed_precision='bf16' if arg.bf16 else 'no')
 
-    assert scheduler.pred_type == sampler.pred_type, \
-        f'scheduler pred_type "{scheduler.pred_type}" does not match sampler pred_type "{sampler.pred_type}"'
+    # Per-process seed offset → decorrelated diffusion noise across GPUs
+    seed_everything(arg.seed + accelerator.process_index)
 
-    print(f'params: {count_parameters(model) / 1e+6}')
+    model     = get_model(arg.model_type, **arg.model_cfg)
+    scheduler = get_scheduler(arg.scheduler_type, **arg.scheduler_cfg)
+    # Top-level guidance_scale / cfg_interval are defaults; sampler_cfg overrides
+    sampler_kwargs = {
+        'guidance_scale': arg.guidance_scale,
+        'cfg_interval': arg.cfg_interval,
+        **arg.sampler_cfg,
+    }
+    sampler = get_sampler(arg.sampler_type, scheduler, **sampler_kwargs)
+
+    accelerator.print(f'Model parameters: {count_parameters(model) / 1e6:.2f}M')
 
     trainer = Trainer(
-        train_args, 
-        model, 
-        scheduler, 
-        sampler, 
-        resume_ckpt_dir=resume_ckpt_dir, 
-        overwrite=overwrite
-        )
+        accelerator=accelerator,
+        arg=arg,
+        model=model,
+        scheduler=scheduler,
+        sampler=sampler,
+        resume_ckpt_dir=resume_ckpt_dir,
+        overwrite=overwrite,
+    )
     trainer.train()
 
 
-# nohup python train.py arg_json/rf_cifar_attn.json > stdouts/rf_cifar_attn &
 if __name__ == '__main__':
     fire.Fire(main)
