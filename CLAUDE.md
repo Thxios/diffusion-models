@@ -23,9 +23,6 @@ python train.py --resume_ckpt_dir outputs/<run>
 
 # Overwrite existing output_dir without interactive prompt
 python train.py --train_arg_json arg_json/... --overwrite
-
-# Class-conditioned MNIST single-class experiments
-bash run_single_cls.sh                # runs cls1..cls9 sequentially
 ```
 
 FID evaluation:
