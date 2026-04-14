@@ -265,19 +265,20 @@ class JITTransformer(nn.Module, GuidedPredictor):
             ffn_bias=True,
             attn_bias=True,
             dropout=0.0,
+            rope_max_res=1024,
     ):
         super().__init__()
         self.patch_size = patch_size
 
         self.patchify = BottleneckPatchEmbedder(
-            patch_size, 
-            in_channels, 
-            hidden_size, 
+            patch_size,
+            in_channels,
+            hidden_size,
             bottleneck_size
         )
         self.time_embedding = TimestepEmbedder(
-            time_encoding_dim, 
-            embedding_size, 
+            time_encoding_dim,
+            embedding_size,
             max_period=max_period,
             time_scaling=time_scaling
         )
@@ -292,7 +293,7 @@ class JITTransformer(nn.Module, GuidedPredictor):
             self.class_embedding = None
 
         head_dim = hidden_size // num_heads
-        self.rope_2d = Dynamic2DRoPE(head_dim, max_res=1024)
+        self.rope_2d = Dynamic2DRoPE(head_dim, max_res=rope_max_res)
 
         self.layers = nn.ModuleList([
             TransformerBlock(
