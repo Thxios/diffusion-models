@@ -3,6 +3,7 @@ outputs
 resources
 stdouts
 test_notebooks
+arg_json/test_args
 
 **/_cache_*
 _cache_*
