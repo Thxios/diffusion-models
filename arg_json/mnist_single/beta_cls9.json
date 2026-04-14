@@ -19,7 +19,6 @@
   "dataset_dir": "~/datasets",
   "augmentations": [],
   "dataloader_num_workers": 2,
-  "device": "cuda:2",
   "seed": 42,
   "model_type": "unet",
   "model_cfg": {

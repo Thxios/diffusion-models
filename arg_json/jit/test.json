@@ -23,7 +23,6 @@
   "lr": 0.0002,
   "lr_scheduler": "constant_with_warmup",
   "lr_warmup_steps": 1000,
-  "lr_schduler_cfg": {},
   "optimizer": "adamw",
   "adam_betas": [
     0.9,
@@ -40,7 +39,6 @@
   "dataloader_num_workers": 4,
   "dataloader_drop_last": true,
   "dataloader_pin_memory": true,
-  "device": "cuda:5",
   "seed": 42,
   "compile": false,
   "class_conditioning": false,
@@ -74,5 +72,6 @@
   "sampler_cfg": {
     "n_steps": 50,
     "ode_solver": "euler"
-  }
+  },
+  "lr_scheduler_cfg": {}
 }

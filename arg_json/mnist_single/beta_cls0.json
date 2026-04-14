@@ -1,6 +1,5 @@
 {
   "output_dir": "outputs/mnist_single/beta_cls0",
-
   "max_steps": 20000,
   "logging_steps": 50,
   "eval_steps": 500,
@@ -16,15 +15,11 @@
   "use_ema": true,
   "ema_inv_gamma": 1.0,
   "ema_power": 0.75,
-
   "class_filter": 0,
-
   "dataset_dir": "~/datasets",
   "augmentations": [],
   "dataloader_num_workers": 2,
-  "device": "cuda:2",
   "seed": 42,
-
   "model_type": "unet",
   "model_cfg": {
     "in_channels": 1,

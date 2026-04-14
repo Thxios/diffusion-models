@@ -7,7 +7,6 @@
   "save_steps": 20000,
   "eval_n_examples": 40,
   "guidance_scale": 1.0,
-
   "fid_eval_steps": 20000,
   "fid_ema": true,
   "fid_reference_dataset": "cifar10-train",
@@ -15,8 +14,12 @@
   "generation_batch_size": 256,
   "inception_batch_size": 512,
   "adjust_fid_n": true,
-  "fid_adjust_subsets": [4000, 6000, 8000, 10000],
-
+  "fid_adjust_subsets": [
+    4000,
+    6000,
+    8000,
+    10000
+  ],
   "batch_size": 128,
   "lr": 0.0002,
   "lr_scheduler": "linear",
@@ -28,12 +31,12 @@
   "ema_power": 0.75,
   "dataset": "cifar10",
   "dataset_dir": "~/datasets",
-  "augmentations": ["RandomHorizontalFlip"],
+  "augmentations": [
+    "RandomHorizontalFlip"
+  ],
   "dataloader_num_workers": 2,
-  "device": "cuda:6",
   "seed": 42,
   "bf16": true,
-
   "p_uncond": 0.2,
   "model_type": "unet",
   "model_cfg": {
