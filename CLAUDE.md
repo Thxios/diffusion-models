@@ -92,6 +92,11 @@ Three orthogonal axes compose a run: **model** × **scheduler** × **sampler**. 
 
 - `migrate_train_args.py` — one-shot migration script for old `outputs/**/train_args.json` files.
 
+- `legacy/` — superseded scripts kept for reference only; **do not use**.
+  - `train_jit.py`, `train_jit_multigpu.py` → replaced by `train.py`
+  - `train_cls0.py` → replaced by `train.py`
+  - `jit_fid.py`, `save_fid_eval.py` → replaced by `fid_eval.py`
+
 - `arg_json/` — run configs grouped by backbone (`unet/`, `jit/`, `mnist_single/`). `arg_json/test_args/` is git-ignored and holds quick smoke-test configs.
 
 - `notebooks/`, `test_notebooks/` — interactive analysis; not part of any automated pipeline.
